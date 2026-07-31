@@ -15,4 +15,3 @@
 
 `sample/demo_xianren_0_4s.wav` 是从现有录音中截取的 4 秒片段，只用于运行 `python demo.py --self-test`。文件采样率为 250 kHz，单声道，PCM 16-bit，体积约 2 MB。
 
-提交公开仓库前，仍应确认原始录音的数据授权与公开范围。
