@@ -1,0 +1,11 @@
+﻿metric,value,unit
+recording_count,10.0,recordings
+total_duration,466.88,seconds
+candidate_pulse_count,578.0,pulses
+accepted_bat_pulse_count,441.0,pulses
+rejected_noise_candidate_count,137.0,pulses
+split_candidate_count,92.0,candidates
+separated_component_count,262.0,components
+noise_gate_pseudo_label_accuracy,0.992,ratio
+cluster_silhouette_score,0.295,score
+temporary_classifier_cluster_consistency,0.964,ratio

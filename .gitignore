@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Raw/private audio data
+data/*.zip
+data/*.wav
+data/raw/*
+!data/raw/.gitkeep
+
+# Generated models
+models/*
+!models/.gitkeep
+
+# Heavy generated artifacts
+results/audio/
+results/predictions/
+results/figures/spectrograms/
+results/figures/pulse_zooms/
+results/figures/cluster_examples/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+data/Éù²¨ÎÄ¼ş.zip
