@@ -1,3 +1,11 @@
+"""可复现的快速演示入口：从仓库自带结果表训练两级演示模型并预测。
+
+与主流程的区别（有意设计，勿擅自合并）：
+本模块使用 results/tables/ 下已提交的 CSV 重新训练小模型，
+随机森林规模较小（noise/bat 300 棵、A-D 400 棵），
+而 pipeline 全流程训练用 600 棵——这样无需原始录音数据即可复现演示。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -27,7 +35,8 @@ from .config import (
     PULSE_ZOOM_DIR,
     SEPARATED_PULSE_DIR,
 )
-from .pipeline import accepted_mask, predict_one_demo_wav_two_stage
+from .features import accepted_mask
+from .prediction import predict_one_demo_wav_two_stage
 
 DEFAULT_MODEL_PATH = MODEL_DIR / "demo_two_stage_model.joblib"
 DEFAULT_SAMPLE_PATH = (

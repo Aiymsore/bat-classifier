@@ -1,180 +1,119 @@
-# 蝙蝠超声信号检测与声型聚类原型
+# 蝙蝠超声信号检测与声型分类程序 · 代码结构说明
 
-这是一个面向生态声学场景的 Python 原型项目：从野外蝙蝠超声录音中自动检测脉冲、提取声学特征、过滤噪声，并将有效脉冲聚类为 A–D 四类临时声型。项目重点是证明“原始录音 → 脉冲检测 → 特征工程 → 聚类/分类 → 新录音预测”的完整流程可以运行。
+程序从蝙蝠超声录音（WAV，250 kHz）中自动检测脉冲、提取声学特征，并通过两级模型对新录音分类：第一层判断 noise/bat，第二层把 bat 脉冲归入 A–D 四类声型。A–D 是无监督聚类得到的临时声型标签，不是物种标签。
 
-> **项目定位**：当前版本是声学信号处理与机器学习原型，不是经过专家验证的蝙蝠物种鉴定系统。A–D 代表无监督聚类得到的声型，不能直接写成真实物种。
-
-## 核心功能
-
-- 对 250 kHz WAV 录音进行高通滤波和分块分析。
-- 自动检测并精修蝙蝠候选脉冲。
-- 实验性分离同一时间段内的近频声波分量。
-- 提取持续时间、峰值频率、带宽、频率斜率、SNR 等特征。
-- 通过两级流程完成 `noise/bat` 判断与 A–D 声型分类。
-- 输出 PCA 图、聚类中心、录音级汇总、模型文件和新录音预测结果。
-
-## 技术栈
-
-Python、NumPy、Pandas、SciPy、Librosa、SoundFile、Matplotlib、scikit-learn、Joblib。
-
-## 项目结构
+## 数据流程
 
 ```text
-bat-classifier/
-├─ demo.py                        # 无需完整原始数据的快速演示
-├─ run.py                         # 完整训练流程入口
-├─ requirements.txt
-├─ src/bat_classifier/
-│  ├─ config.py                   # 参数与路径配置
-│  └─ pipeline.py                 # 核心处理流程
-├─ data/
-│  ├─ README.md
-│  ├─ raw/                        # 本地原始 WAV，不提交
-│  └─ sample/                     # 内置4秒演示WAV
-├─ results/
-│  ├─ figures/                    # 关键结果图
-│  ├─ tables/                     # CSV 汇总与指标
-│  ├─ predictions/                # 新录音预测
-│  └─ audio/                      # 切片与分离音频
-├─ models/                        # 训练模型，不默认提交
-└─ docs/methodology.md            # 方法、边界与后续计划
+WAV录音
+  → audio_io        读取、重采样、高通滤波
+  → detection       候选脉冲检测与边界精修
+  → features        特征提取、质量筛选
+  → separation      同时近频声波分离（实验性）
+  → pulse_table     逐脉冲明细建表
+  → noise_gate      第一层 noise/bat 门控训练
+  → clustering      第二层 A-D 声型聚类训练
+  → prediction      新录音两级预测
+  → results/        CSV、JSON、图像、分离音频输出
 ```
 
-## 可直接运行的 Demo
+## 各模块功能
 
-仓库内置一个 4 秒、约 2 MB 的示例 WAV。它用于展示“候选脉冲检测 → noise/bat 判断 → A-D 临时声型分类 → CSV/JSON 输出”的完整推理流程，不需要下载 167 MB 的原始数据包。
+### config.py — 路径与参数配置
 
-安装依赖后运行：
+集中存放全部常量：目录路径与结果表文件名、检测参数（能量阈值 `-28 dB`、脉冲时长 0.8–40 ms、合并间隔、填充余量）、边界精修参数（`CORE_*`）、质量门槛（SNR ≥ 4 dB、轨迹覆盖率 ≥ 0.55 等）、聚类配置（11 个特征列、4 类、单录音样本上限）、分块检测窗口、分离参数（`SEPARATION_*`）、门控参数。调参只需改此文件。
 
-```powershell
-python demo.py --self-test
-```
+### audio_io.py — 音频读取与频谱基础
 
-Windows 也可以双击根目录的 `run_demo.bat`。
+- `load_audio`：读取 WAV，重采样到 250 kHz 单声道，去直流、高通滤波、峰值归一化。
+- `highpass_filter`：4 阶 butter 高通，滤除 15 kHz 以下背景噪声。
+- `calculate_audio_content_hash`：对解码后波形计算 SHA-256，识别内容重复的录音（与文件头无关）。
+- `build_spectrogram`：计算功率谱（n_fft=1024，hop=256）。
+- `find_wav_files`：递归查找 `.wav` / `.WAV`。
+- `ultrasonic_band_mask`、`adaptive_stft_params`、`interval_overlap_ratio`：按片段长度自适应 STFT 参数、超声频段（15–120 kHz）掩码、时间区间重叠比例，供下游多个模块复用。
 
-首次运行会使用仓库已有的两个结果表自动构建演示模型：
+### detection.py — 候选脉冲检测与边界精修
 
-- `results/tables/acoustic_pulses.csv`：训练第一层 `noise/bat` 模型；
-- `results/tables/acoustic_clusters_ABCD.csv`：训练第二层 A-D 临时声型模型。
+- `detect_pulses`：对超声频段能量同时施加固定相对阈值和背景自适应阈值，找出候选脉冲区间。
+- `merge_active_frames`：把间隔很短的活动帧合并成连续区。
+- `select_group_containing_peak` + `refine_pulse_boundary`：在候选区内部重新定位高信噪比脉冲核心，去掉前后背景拖尾。
+- `refine_all_pulses`：批量精修，并按重叠比例 ≥ 0.60 去重。
+- `remove_duplicate_boundary_pulses`：删除分块重叠区域重复检测到的同一脉冲（重叠 ≥ 0.50 或中心距 ≤ 1.5 ms）。
+- `detect_and_refine_pulses_chunked`：长录音按 4 秒窗口取首/中/尾分块检测，再合并去重，缩短演示运行时间。
 
-默认输入为：
+### features.py — 单脉冲特征提取与质量筛选
 
-```text
-data/sample/demo_xianren_0_4s.wav
-```
+- `extract_pulse_features`：只在可靠高能量帧上计算峰值频率、起止频率、频率下降幅度、f05/f95、90% 带宽、频率斜率、主导频率轨迹覆盖率、最大跳频、RMS。
+- `evaluate_pulse_quality`：与物种无关的通用质量门槛，返回接受/拒绝及原因（low_snr、low_track_coverage、unstable_frequency_track、peak_frequency_out_of_range）。
+- `weighted_frequency_quantile`：功率加权频率分位数。
+- `accepted_mask`：兼容布尔列和 CSV 读回的字符串布尔列。
+- `numeric_feature_frame`：特征列统一转数值并把 ±inf 替换为 NaN。
 
-也可以预测自己的 WAV：
+### separation.py — 同时近频声波分离（实验性）
 
-```powershell
-python demo.py --input "D:\audio\new_recording.wav"
-```
+- `_link_spectral_peak_tracks`：逐帧寻找频谱局部峰，用带速度预测的贪心匹配连成频率轨迹。
+- `_compare_simultaneous_tracks` / `_tracks_are_harmonic_duplicates`：判断两条轨迹是否时间重叠足够、中位频率差可分辨、排除二/三次谐波误判。
+- `separate_simultaneous_pulse_components`：确认存在 ≥ 2 条独立轨迹时，按高斯软掩码把混合波形拆成多条分量音频；否则原样返回，避免对普通单脉冲造成失真。
+- `save_separated_pulse` / `clear_separated_pulses_for_source`：分离分量 WAV 的写盘与重建前清理。
 
-需要强制重新构建演示模型时：
+### pulse_table.py — 数据准备与逐脉冲建表
 
-```powershell
-python demo.py --rebuild-model --self-test
-```
+- `prepare_demo_dataset`：创建全部输出目录；`data/raw` 无 WAV 时从 `data/` 下的压缩包解压。
+- `create_demo_pulse_rows`：对每个精修候选尝试分离，逐分量提取特征并做质量筛选；若分离出的分量通不过质量门槛则回退为原混合脉冲。
+- `build_demo_pulse_table`：遍历全部录音（内容哈希去重），生成逐脉冲明细 `acoustic_pulses.csv` 和录音级检测汇总。
 
-成功后主要输出到：
+### visualization.py — 图像输出
 
-```text
-results/predictions/<文件名>_noise_ABCD.csv
-results/predictions/demo_summary.json
-results/figures/spectrograms/
-results/figures/pulse_zooms/
-```
+- `save_fast_overview_spectrogram`：整段录音概览声谱图，时间帧数限制在约 4000 以内。
+- `save_top_pulse_zoom_grid`：能量最强的若干脉冲放大图，叠加每帧主导频率轮廓线。
+- `save_pca_plot`：A-D 聚类的 PCA 二维散点图。
+- 导入本模块即完成 matplotlib Agg 后端与中文字体设置。
 
-本仓库附带样例在当前测试环境中检测到 61 个有效候选，其中 51 个判为 bat、10 个判为 noise；主要临时声型为 C。该结果只用于验证工程链路可运行，不能解释为真实物种识别结论。测试记录见 [`docs/demo_test.md`](docs/demo_test.md)。
+### clustering.py — A-D 声型聚类
 
-## 快速开始
+- `prepare_cluster_data`：只取合格脉冲，数值清洗，限制单个录音最多贡献 150 个脉冲。
+- `standardize_cluster_centers` + `create_acoustic_type_mapping`：在四个聚类中心之间标准化，按 FM 型 / CF 型 / 低频窄带评分把无意义的 KMeans 编号稳定映射为 A-D。
+- `cluster_acoustic_types`：标准化 + KMeans（k=4）、PCA、轮廓系数，保存聚类模型 `.joblib` 与元数据 JSON。
+- `train_temporary_classifier`：训练复现 A-D 标签的临时随机森林（600 棵），输出与聚类标签的一致率。
+- `save_cluster_representatives`：每类取距中心最近的 10 个代表脉冲，复制到 `cluster_examples/声型A-D/`。
+- `create_recording_cluster_summary`：统计每段录音中 A-D 的数量与占比。
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+### noise_gate.py — 第一层 noise/bat 门控
 
-把原始数据按以下任一种方式放置：
+- `prepare_noise_gate_data`：用质量筛选结果生成原型伪标签（accepted→bat，rejected→noise），按录音×类别限量保留，两类都保留靠前的难样本。
+- `make_noise_gate_model` / `train_noise_gate`：随机森林（600 棵），≥ 4 个独立录音时按录音分组留出 25% 验证，保存模型与验证明细 CSV。
+- `apply_noise_gate`：对新候选批量输出 bat/noise 概率，按阈值 0.55 判定。
 
-- 将 `声波文件.zip` 放到 `data/`；
-- 或直接将 WAV 文件放到 `data/raw/`。
+### prediction.py — 新录音两级预测
 
-然后运行：
+- `predict_one_demo_wav_two_stage`：单个 WAV 完整走 检测 → 分离 → 门控 → A-D 分类，写出逐片段预测 CSV、概览声谱图和放大图，返回汇总 dict。
+- `predict_demo_path_two_stage`：支持单个文件或整个文件夹，写出预测汇总 CSV。
 
-```powershell
-python run.py
-```
+### pipeline.py — 完整流程编排
 
-训练完成后，可按照终端提示输入一个 WAV 文件或文件夹路径进行预测。
+`main()`：数据准备 → 脉冲建表 → 门控训练 → 聚类训练 → 合并保存两级模型 `noise_bat_ABCD_model.joblib` → 交互输入新 WAV/文件夹路径预测。只做流程串联，算法细节都在各功能模块。
 
-## 结果应该放在哪里？
+### demo.py — 轻量演示
 
-完整结果放在 `results/`，README 只展示最关键的部分。推荐做法如下：
+从 `results/tables/` 已提交的两个结果表（`acoustic_pulses.csv`、`acoustic_clusters_ABCD.csv`）重建小规模两级模型（随机森林 300/400 棵，与 pipeline 的 600 棵不同，是有意设计），无需原始录音数据即可复现演示。含 argparse CLI：`--input`、`--model`、`--rebuild-model`、`--self-test`。
 
-| 内容 | 保存位置 | 是否放进主 README |
-|---|---|---|
-| PCA 聚类图 | `results/figures/cluster_pca_ABCD.png` | 是 |
-| 混淆矩阵或验证图 | `results/figures/` | 是 |
-| 核心指标表 | `results/tables/` | 在 README 摘要展示 |
-| 逐脉冲完整特征 | `results/tables/acoustic_pulses.csv` | 只提供链接 |
-| 预测明细 | `results/predictions/` | 通常不展示 |
-| 大量切片音频 | `results/audio/` | 不提交 GitHub |
-| 模型文件 | `models/` | 说明即可，必要时发布到 Release |
+## 入口与测试
 
-不要把所有结果图片都堆进 README。面试官通常只需要在 30 秒内看明白：数据是什么、做了什么、结果如何、限制是什么。
+| 文件 | 作用 |
+|---|---|
+| `run.py` | 完整训练流程入口：`python run.py` |
+| `demo.py`（根目录） | 演示入口：`python demo.py --self-test` |
+| `run_demo.bat` | Windows 双击运行演示（内部调用 `demo.py --self-test`） |
+| `src/bat_classifier/__main__.py` | 支持 `python -m bat_classifier` |
+| `tests/test_demo_smoke.py` | 端到端冒烟测试：临时目录建模、跑内置样例 WAV、检查输出文件 |
 
-## 当前原型运行结果
+## 输出目录
 
-本仓库附带一次本地样例运行的汇总结果：
-
-| 指标 | 结果 |
-|---|---:|
-| 原始录音 | 10 条，共 466.88 秒 |
-| 检测到的候选片段 | 578 个 |
-| 通过质量筛选的脉冲 | 441 个 |
-| 被拒绝的噪声/低质量片段 | 137 个 |
-| A/B/C/D 声型数量 | 131 / 70 / 210 / 30 |
-| KMeans 轮廓系数 | 0.295 |
-| noise/bat 原型伪标签一致率 | 99.20% |
-| 临时随机森林复现聚类标签一致率 | 96.40% |
-
-轮廓系数 0.295 表明四类声型存在一定结构，但组间仍有明显重叠。因此，这个结果适合证明流程可行，不足以证明四个自然物种被清晰分开。两个“一致率”衡量的是模型对当前规则标签或聚类标签的复现能力，也不是真实物种识别准确率。
-
-### PCA 声型分布
-
-![PCA acoustic clusters](results/figures/cluster_pca_ABCD.png)
-
-### noise/bat 原型伪标签验证
-
-![Noise bat validation](results/figures/noise_gate_confusion_matrix.png)
-
-详细汇总见 [`results/tables/experiment_summary.csv`](results/tables/experiment_summary.csv)、[`recording_cluster_summary.csv`](results/tables/recording_cluster_summary.csv) 和 [`cluster_centers_ABCD.csv`](results/tables/cluster_centers_ABCD.csv)。
-
-## 当前评估说明
-
-当前第一层 `noise/bat` 标签主要来自自动质量规则，A–D 来自 KMeans 聚类。因此，内部验证分数只能说明模型能否复现这套原型标签，不能当成真实物种识别准确率。正式物种分类需要老师或专家确认的标签，并按“原始录音”分组划分训练集与测试集。
-
-正式版本建议至少报告：
-
-- 录音数量、有效脉冲数量与各类别样本量；
-- 宏平均 Precision、Recall、F1；
-- 混淆矩阵；
-- 按录音分组的交叉验证结果；
-- 未见过地点或设备上的外部测试结果。
-
-## 项目亮点
-
-- 不是通用教学数据集，而是面向真实生态声学录音。
-- 包含信号处理、特征工程、无监督学习、监督分类和结果可视化的完整链路。
-- 对重复录音、噪声片段、长录音内存占用和同时近频声波进行了专门处理。
-- 明确区分“临时声型聚类”和“真实物种鉴定”，避免夸大结论。
-
-## 已知限制与下一步
-
-1. 获取可靠物种标签，替换 A–D 临时声型。
-2. 增加不同地点、设备、距离和背景噪声条件下的数据。
-3. 将 4000 行级核心流程继续拆分为检测、特征、聚类、预测模块，并补充单元测试。
-4. 增加命令行参数，取消交互式路径输入。
-5. 提供 1–3 个可公开示例 WAV 和可复现的基准结果。
-
-更完整的方法说明见 [`docs/methodology.md`](docs/methodology.md)。
+| 目录 | 内容 |
+|---|---|
+| `results/tables/` | 脉冲明细、检测汇总、聚类结果、聚类中心、代表脉冲、录音声型汇总、门控验证明细 |
+| `results/figures/` | 概览声谱图、脉冲放大图、PCA 图、`cluster_examples/`（每类代表脉冲） |
+| `results/audio/separated_pulses/` | 分离出的分量音频 |
+| `results/predictions/` | 新录音逐片段预测 CSV 与 `demo_summary.json` |
+| `models/` | 门控模型、A-D 聚类模型及元数据、合并两级模型 |
+| `data/raw/` | 原始演示 WAV（本地，不提交）；`data/sample/` 内置 4 秒演示 WAV |
