@@ -100,11 +100,13 @@ def _build_noise_gate(pulse_table: pd.DataFrame) -> dict[str, Any]:
 def _unique_cluster_mapping(
     raw_clusters: np.ndarray,
     target_labels: pd.Series,
+    acoustic_types: list[str],
 ) -> dict[int, str]:
-    acoustic_types = ["A", "B", "C", "D"]
-    contingency = np.zeros((4, 4), dtype=int)
+    """用最优指派把 KMeans 原始簇编号映射到实际出现的声型标签。"""
+    class_count = len(acoustic_types)
+    contingency = np.zeros((class_count, class_count), dtype=int)
 
-    for cluster_id in range(4):
+    for cluster_id in range(class_count):
         cluster_labels = target_labels.loc[raw_clusters == cluster_id]
         counts = cluster_labels.value_counts()
         for type_index, acoustic_type in enumerate(acoustic_types):
@@ -130,13 +132,14 @@ def _build_acoustic_classifier(cluster_table: pd.DataFrame) -> dict[str, Any]:
 
     features = _numeric_frame(cluster_table, list(CLUSTER_FEATURE_COLUMNS))
     labels = cluster_table["acoustic_type"].astype(str)
-    valid = features.notna().all(axis=1) & labels.isin(["A", "B", "C", "D"])
+    label_set = sorted(labels.dropna().unique().tolist())
+    valid = features.notna().all(axis=1) & labels.isin(label_set)
     features = features.loc[valid]
     labels = labels.loc[valid]
 
-    if labels.nunique() != 4:
+    if labels.nunique() < 2:
         raise RuntimeError(
-            "A-D 声型标签不完整："
+            "声型标签种类不足，无法训练第二层模型："
             f"{labels.value_counts().to_dict()}"
         )
 
@@ -144,12 +147,12 @@ def _build_acoustic_classifier(cluster_table: pd.DataFrame) -> dict[str, Any]:
     scaled = scaler.fit_transform(features)
 
     kmeans = KMeans(
-        n_clusters=4,
+        n_clusters=len(label_set),
         n_init=30,
         random_state=RANDOM_STATE,
     )
     raw_clusters = kmeans.fit_predict(scaled)
-    mapping = _unique_cluster_mapping(raw_clusters, labels)
+    mapping = _unique_cluster_mapping(raw_clusters, labels, label_set)
 
     classifier = RandomForestClassifier(
         n_estimators=400,
@@ -166,10 +169,14 @@ def _build_acoustic_classifier(cluster_table: pd.DataFrame) -> dict[str, Any]:
         "temporary_classifier": classifier,
         "raw_cluster_to_type": mapping,
         "feature_columns": list(CLUSTER_FEATURE_COLUMNS),
-        "type_descriptions": ACOUSTIC_TYPE_DESCRIPTIONS,
+        "labels": label_set,
+        "type_descriptions": {
+            label: ACOUSTIC_TYPE_DESCRIPTIONS.get(label, "")
+            for label in label_set
+        },
         "training_rows": int(len(features)),
         "warning": (
-            "A-D 是无监督聚类形成的临时声型，"
+            "声型标签是无监督聚类形成的临时类型，"
             "不是经过专家确认的物种标签。"
         ),
     }

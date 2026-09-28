@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 import joblib
@@ -27,6 +28,7 @@ from .features import accepted_mask, numeric_feature_frame
 from .visualization import save_pca_plot
 from .config import (
     ACOUSTIC_TYPE_DESCRIPTIONS,
+    ACOUSTIC_TYPE_LABELS,
     BASE_DIR,
     CLUSTER_CENTER_CSV,
     CLUSTER_EXAMPLE_DIR,
@@ -41,7 +43,6 @@ from .config import (
     LOW_FREQ_HZ,
     MAX_CLUSTER_PULSES_PER_RECORDING,
     MIN_PULSES_FOR_CLUSTERING,
-    N_ACOUSTIC_TYPES,
     RANDOM_STATE,
     RECORDING_CLUSTER_CSV,
     REPRESENTATIVE_PULSES_PER_TYPE,
@@ -50,6 +51,7 @@ from .config import (
     SEPARATION_MIN_SECONDARY_RELATIVE_DB,
     SEPARATION_MIN_TEMPORAL_OVERLAP,
     TARGET_SAMPLE_RATE,
+    validate_labels,
 )
 
 
@@ -91,7 +93,7 @@ def prepare_cluster_data(
         raise RuntimeError(
             f"合格脉冲只有 {len(data)} 个，"
             f"至少需要 {MIN_PULSES_FOR_CLUSTERING} 个"
-            "才能稳定演示四类聚类。"
+            "才能稳定进行声型聚类。"
         )
 
     # 一个长录音可能含几百个脉冲。
@@ -163,16 +165,42 @@ def standardize_cluster_centers(
 
 def create_acoustic_type_mapping(
     centers_df: pd.DataFrame,
+    labels: list[str] | None = None,
 ) -> dict[int, str]:
     """
-    KMeans的0、1、2、3没有固定含义。
-    用聚类中心的声学特征把它们稳定映射为A-D：
+    KMeans的原始编号没有固定含义，需要稳定映射为声型标签。
 
+    默认 A-D 四类时沿用语义规则：
     A：下降幅度和带宽较大的FM型；
     B：高频、持续较长、较窄带的CF型；
     C：低频、较窄带、变化较缓；
     D：剩余的复杂或中间型。
+
+    其他标签集或类数使用通用规则：
+    聚类中心按峰值频率升序排列，依次分配标签列表中的名称。
     """
+    if labels is None:
+        labels = list(ACOUSTIC_TYPE_LABELS)
+
+    if labels == ["A", "B", "C", "D"] and len(centers_df) == 4:
+        return _semantic_abcd_mapping(centers_df)
+
+    order = sorted(
+        (int(index) for index in centers_df.index),
+        key=lambda cluster: float(
+            centers_df.loc[cluster, "peak_freq_khz"]
+        ),
+    )
+    return {
+        cluster: labels[position]
+        for position, cluster in enumerate(order)
+    }
+
+
+def _semantic_abcd_mapping(
+    centers_df: pd.DataFrame,
+) -> dict[int, str]:
+    """默认A-D四类的语义评分映射（历史实现，保持默认输出不变）。"""
     z = standardize_cluster_centers(
         centers_df
     )
@@ -238,11 +266,20 @@ def save_cluster_representatives(
     scaled_features: np.ndarray,
     kmeans: KMeans,
     mapping: dict[int, str],
+    labels: list[str] | None = None,
+    type_descriptions: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """
     找出距离每个聚类中心最近的代表脉冲，
-    并复制到 cluster_examples/声型A-D。
+    并复制到 cluster_examples/声型<标签> 目录。
     """
+    if labels is None:
+        labels = list(ACOUSTIC_TYPE_LABELS)
+    descriptions = (
+        dict(type_descriptions)
+        if type_descriptions
+        else dict(ACOUSTIC_TYPE_DESCRIPTIONS)
+    )
     representative_rows: list[
         dict[str, float | int | str]
     ] = []
@@ -257,7 +294,11 @@ def save_cluster_representatives(
 
     for raw_cluster, acoustic_type in sorted(
         mapping.items(),
-        key=lambda item: item[1],
+        key=lambda item: (
+            labels.index(item[1])
+            if item[1] in labels
+            else len(labels)
+        ),
     ):
         indices = np.where(
             raw_labels == raw_cluster
@@ -389,9 +430,10 @@ def save_cluster_representatives(
                 {
                     "acoustic_type": acoustic_type,
                     "description": (
-                        ACOUSTIC_TYPE_DESCRIPTIONS[
-                            acoustic_type
-                        ]
+                        descriptions.get(
+                            acoustic_type,
+                            "",
+                        )
                     ),
                     "rank": rank,
                     "source_file": row[
@@ -428,19 +470,28 @@ def save_cluster_representatives(
 def create_recording_cluster_summary(
     clustered_df: pd.DataFrame,
     detection_df: pd.DataFrame,
+    labels: list[str] | None = None,
+    type_descriptions: dict[str, str] | None = None,
 ) -> pd.DataFrame:
-    """统计每段录音中A-D各自所占比例。"""
+    """统计每段录音中各声型所占比例。"""
+    if labels is None:
+        labels = list(ACOUSTIC_TYPE_LABELS)
+    descriptions = (
+        dict(type_descriptions)
+        if type_descriptions
+        else dict(ACOUSTIC_TYPE_DESCRIPTIONS)
+    )
     count_table = pd.crosstab(
         clustered_df["source_file"],
         clustered_df["acoustic_type"],
     )
 
-    for acoustic_type in ["A", "B", "C", "D"]:
+    for acoustic_type in labels:
         if acoustic_type not in count_table:
             count_table[acoustic_type] = 0
 
     count_table = count_table[
-        ["A", "B", "C", "D"]
+        labels
     ]
     total = count_table.sum(axis=1)
 
@@ -451,7 +502,7 @@ def create_recording_cluster_summary(
         }
     ).reset_index(drop=True)
 
-    for acoustic_type in ["A", "B", "C", "D"]:
+    for acoustic_type in labels:
         summary[
             f"type_{acoustic_type}_count"
         ] = count_table[
@@ -475,7 +526,7 @@ def create_recording_cluster_summary(
     ] = summary[
         "major_acoustic_type"
     ].map(
-        ACOUSTIC_TYPE_DESCRIPTIONS
+        lambda label: descriptions.get(label, "")
     )
     summary["major_type_ratio"] = (
         count_table.max(axis=1).to_numpy()
@@ -565,11 +616,109 @@ def train_temporary_classifier(
     )
 
 
+def _interpret_silhouette(value: float) -> str:
+    """把轮廓系数翻译成一句中文评价。"""
+    if value >= 0.5:
+        return "组间分离明显"
+    if value >= 0.25:
+        return "有一定结构，但组间重叠较多"
+    return "组间重叠严重，结果仅供流程演示参考"
+
+
+def build_zh_summary(
+    labels: list[str],
+    descriptions: dict[str, str],
+    pulse_count: int,
+    recording_count: int,
+    silhouette: float | None,
+    consistency: float | None,
+    pca_ratios: list[float] | None,
+    separation: dict[str, object] | None,
+    trained_at: str | None = None,
+) -> str:
+    """把训练元数据渲染成人类可读的中文摘要。
+
+    元数据写入（cluster_acoustic_types）与界面兜底渲染
+    （模型管理页对旧元数据）共用此函数。
+    """
+    lines: list[str] = []
+    header = "【训练摘要】"
+    if trained_at:
+        header += f" {trained_at}"
+    lines.append(header)
+
+    lines.append(
+        f"声型标签：{'、'.join(labels)}（共{len(labels)}类）"
+    )
+    desc_text = " ｜ ".join(
+        f"{label}：{descriptions.get(label, '') or '（无描述）'}"
+        for label in labels
+    )
+    lines.append(f"  {desc_text}")
+
+    lines.append(
+        f"训练规模：{pulse_count} 个合格脉冲，来自 {recording_count} 条录音"
+    )
+
+    if silhouette is not None:
+        lines.append(
+            f"聚类质量：轮廓系数 {silhouette:.3f} —— "
+            f"{_interpret_silhouette(silhouette)}"
+            "（取值0~1，越大组间分得越开）"
+        )
+    else:
+        lines.append("聚类质量：未计算轮廓系数。")
+
+    if consistency is not None:
+        lines.append(
+            f"临时分类器一致率：{consistency:.2%} —— "
+            "复现聚类标签的能力，不是物种识别准确率"
+        )
+    else:
+        lines.append("临时分类器一致率：样本过少，本次未评估。")
+
+    if pca_ratios:
+        detail = " + ".join(f"{value:.1%}" for value in pca_ratios)
+        lines.append(
+            f"PCA：前{len(pca_ratios)}个主成分共解释 "
+            f"{sum(pca_ratios):.1%} 的特征差异（{detail}）"
+        )
+
+    if separation:
+        enabled = "已启用" if separation.get("enabled") else "未启用"
+        gap = separation.get("minimum_frequency_gap_khz")
+        components = separation.get("maximum_components")
+        extra = ""
+        if gap is not None and components is not None:
+            extra = f"（最小频率间隔 {gap} kHz，最多 {components} 分量）"
+        lines.append(f"声波分离：{enabled}{extra}")
+
+    lines.append("提示：声型标签只代表声学相似类型，不是物种标签。")
+    return "\n".join(lines)
+
+
 def cluster_acoustic_types(
     pulse_df: pd.DataFrame,
     detection_df: pd.DataFrame,
+    labels: list[str] | None = None,
+    type_descriptions: dict[str, str] | None = None,
 ) -> dict[str, object]:
-    """执行四类聚类、生成图表并训练临时分类器。"""
+    """执行声型聚类、生成图表并训练临时分类器。
+
+    labels：声型标签列表（默认 A-D 四类），长度即聚类数 K；
+    type_descriptions：标签到描述文字的映射（默认取 config）。
+    """
+    if labels is None:
+        labels = list(ACOUSTIC_TYPE_LABELS)
+    labels = validate_labels(labels)
+    descriptions = (
+        dict(type_descriptions)
+        if type_descriptions
+        else dict(ACOUSTIC_TYPE_DESCRIPTIONS)
+    )
+    for label in labels:
+        descriptions.setdefault(label, "")
+
     data = prepare_cluster_data(pulse_df)
 
     feature_frame = data[
@@ -582,7 +731,7 @@ def cluster_acoustic_types(
     )
 
     kmeans = KMeans(
-        n_clusters=N_ACOUSTIC_TYPES,
+        n_clusters=len(labels),
         n_init=30,
         random_state=RANDOM_STATE,
     )
@@ -601,14 +750,15 @@ def cluster_acoustic_types(
     centers_df.index.name = "raw_cluster"
 
     mapping = create_acoustic_type_mapping(
-        centers_df
+        centers_df,
+        labels,
     )
     data["acoustic_type"] = data[
         "raw_cluster"
     ].map(mapping)
     data["acoustic_type_description"] = (
         data["acoustic_type"].map(
-            ACOUSTIC_TYPE_DESCRIPTIONS
+            lambda label: descriptions.get(label, "")
         )
     )
 
@@ -624,7 +774,7 @@ def cluster_acoustic_types(
 
     silhouette = None
     if (
-        len(data) > N_ACOUSTIC_TYPES
+        len(data) > len(labels)
         and len(np.unique(raw_labels)) > 1
     ):
         silhouette = float(
@@ -643,7 +793,7 @@ def cluster_acoustic_types(
         center_output[
             "acoustic_type"
         ].map(
-            ACOUSTIC_TYPE_DESCRIPTIONS
+            lambda label: descriptions.get(label, "")
         )
     )
     cluster_counts = (
@@ -655,9 +805,16 @@ def cluster_acoustic_types(
             "acoustic_type"
         ].map(cluster_counts)
     )
+    label_order = {
+        label: position
+        for position, label in enumerate(labels)
+    }
     center_output = (
         center_output.reset_index()
-        .sort_values("acoustic_type")
+        .sort_values(
+            "acoustic_type",
+            key=lambda column: column.map(label_order),
+        )
     )
     center_output.to_csv(
         CLUSTER_CENTER_CSV,
@@ -671,19 +828,23 @@ def cluster_acoustic_types(
         encoding="utf-8-sig",
     )
 
-    save_pca_plot(data)
+    save_pca_plot(data, labels)
     representative_df = (
         save_cluster_representatives(
             data,
             scaled_features,
             kmeans,
             mapping,
+            labels,
+            descriptions,
         )
     )
     recording_summary = (
         create_recording_cluster_summary(
             data,
             detection_df,
+            labels,
+            descriptions,
         )
     )
 
@@ -705,8 +866,9 @@ def cluster_acoustic_types(
         "feature_columns": (
             CLUSTER_FEATURE_COLUMNS
         ),
+        "labels": list(labels),
         "type_descriptions": (
-            ACOUSTIC_TYPE_DESCRIPTIONS
+            descriptions
         ),
         "target_sample_rate": (
             TARGET_SAMPLE_RATE
@@ -738,7 +900,7 @@ def cluster_acoustic_types(
             consistency
         ),
         "warning": (
-            "A-D是由当前无标签数据自动聚类得到的声型，"
+            "声型标签是由当前无标签数据自动聚类得到的，"
             "不是经过物种鉴定的真实物种标签。"
         ),
     }
@@ -747,16 +909,24 @@ def cluster_acoustic_types(
         CLUSTER_MODEL_PATH,
     )
 
+    pca_ratios = [
+        float(value)
+        for value
+        in pca.explained_variance_ratio_
+    ]
     metadata = {
+        "labels": list(labels),
         "acoustic_types": {
-            acoustic_type: (
-                ACOUSTIC_TYPE_DESCRIPTIONS[
-                    acoustic_type
-                ]
+            acoustic_type: descriptions.get(
+                acoustic_type,
+                "",
             )
             for acoustic_type
-            in ["A", "B", "C", "D"]
+            in labels
         },
+        "trained_at": datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
         "pulse_count": int(len(data)),
         "recording_count": int(
             data["source_file"].nunique()
@@ -766,19 +936,32 @@ def cluster_acoustic_types(
             consistency
         ),
         "evaluation_note": note,
-        "pca_explained_variance_ratio": [
-            float(value)
-            for value
-            in pca.explained_variance_ratio_
-        ],
+        "pca_explained_variance_ratio": pca_ratios,
         "model_file": str(
             CLUSTER_MODEL_PATH.name
         ),
         "simultaneous_separation": (
             payload["simultaneous_separation"]
         ),
+        "summary_zh": build_zh_summary(
+            labels=labels,
+            descriptions=descriptions,
+            pulse_count=int(len(data)),
+            recording_count=int(
+                data["source_file"].nunique()
+            ),
+            silhouette=silhouette,
+            consistency=consistency,
+            pca_ratios=pca_ratios,
+            separation=payload[
+                "simultaneous_separation"
+            ],
+            trained_at=datetime.now().strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+        ),
         "warning": (
-            "当前A-D只代表声学相似类型。"
+            "当前声型标签只代表声学相似类型。"
             "拿到老师的物种数据库后，"
             "再把声型标签替换为真实物种标签。"
         ),
@@ -818,7 +1001,7 @@ def cluster_acoustic_types(
             f"\n轮廓系数：{silhouette:.3f}"
         )
         print(
-            "越接近1表示四组分离越明显；"
+            "越接近1表示各组分离越明显；"
             "接近0表示组间重叠较多。"
         )
 
@@ -832,7 +1015,7 @@ def cluster_acoustic_types(
         )
 
     print(
-        f"\n逐脉冲A-D结果："
+        f"\n逐脉冲声型结果："
         f"{CLUSTERED_PULSE_CSV}"
     )
     print(

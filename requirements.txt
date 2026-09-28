@@ -6,3 +6,9 @@ pandas>=2.0
 scikit-learn>=1.3
 scipy>=1.10
 soundfile>=0.12
+
+# 桌面 App 界面
+PySide6>=6.6
+
+# 仅打包 exe 时需要（build_exe.bat 会自动补装）
+pyinstaller>=6.0

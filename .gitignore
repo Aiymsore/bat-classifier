@@ -5,6 +5,11 @@ __pycache__/
 venv/
 .pytest_cache/
 
+# PyInstaller build output
+build/
+dist/
+workspace_backup_tmp/
+
 # Raw/private audio data
 data/*.zip
 data/*.wav
@@ -27,4 +32,8 @@ results/figures/cluster_examples/
 Thumbs.db
 .vscode/
 .idea/
-data/Éù²¨ÎÄ¼þ.zip
+data/*.zip
+
+# Local agent notes / tool caches
+.zcode/
+workspace/

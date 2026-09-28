@@ -25,6 +25,7 @@ plt.rcParams["axes.unicode_minus"] = False
 
 from .audio_io import adaptive_stft_params, ultrasonic_band_mask
 from .config import (
+    ACOUSTIC_TYPE_LABELS,
     CLUSTER_PCA_PNG,
     CONTOUR_MIN_DB,
     HIGH_FREQ_HZ,
@@ -289,13 +290,16 @@ def save_fast_overview_spectrogram(
 
 def save_pca_plot(
     data: pd.DataFrame,
+    labels: list[str] | None = None,
 ) -> None:
     """保存每个点代表一个脉冲的二维PCA聚类图。"""
+    if labels is None:
+        labels = list(ACOUSTIC_TYPE_LABELS)
     figure, axis = plt.subplots(
         figsize=(10, 7)
     )
 
-    for acoustic_type in ["A", "B", "C", "D"]:
+    for acoustic_type in labels:
         group = data[
             data["acoustic_type"]
             == acoustic_type
@@ -314,9 +318,14 @@ def save_pca_plot(
             ),
         )
 
-    axis.set_title(
-        "Bat acoustic pulse clusters A-D (PCA)"
-    )
+    if labels == ["A", "B", "C", "D"]:
+        axis.set_title(
+            "Bat acoustic pulse clusters A-D (PCA)"
+        )
+    else:
+        axis.set_title(
+            "Bat acoustic pulse clusters (PCA)"
+        )
     axis.set_xlabel("PCA component 1")
     axis.set_ylabel("PCA component 2")
     axis.legend()

@@ -73,7 +73,7 @@ WAV录音
 
 - `prepare_cluster_data`：只取合格脉冲，数值清洗，限制单个录音最多贡献 150 个脉冲。
 - `standardize_cluster_centers` + `create_acoustic_type_mapping`：在四个聚类中心之间标准化，按 FM 型 / CF 型 / 低频窄带评分把无意义的 KMeans 编号稳定映射为 A-D。
-- `cluster_acoustic_types`：标准化 + KMeans（k=4）、PCA、轮廓系数，保存聚类模型 `.joblib` 与元数据 JSON。
+- `cluster_acoustic_types`：标准化 + KMeans（k=声型数量）、PCA、轮廓系数，保存聚类模型 `.joblib` 与元数据 JSON（含 `trained_at` 训练时间与中文摘要 `summary_zh`）。
 - `train_temporary_classifier`：训练复现 A-D 标签的临时随机森林（600 棵），输出与聚类标签的一致率。
 - `save_cluster_representatives`：每类取距中心最近的 10 个代表脉冲，复制到 `cluster_examples/声型A-D/`。
 - `create_recording_cluster_summary`：统计每段录音中 A-D 的数量与占比。
@@ -91,11 +91,27 @@ WAV录音
 
 ### pipeline.py — 完整流程编排
 
-`main()`：数据准备 → 脉冲建表 → 门控训练 → 聚类训练 → 合并保存两级模型 `noise_bat_ABCD_model.joblib` → 交互输入新 WAV/文件夹路径预测。只做流程串联，算法细节都在各功能模块。
+`run_full_training(labels, type_descriptions, data_source)`：数据准备 → 脉冲建表 → 门控训练 → 聚类训练 → 合并保存两级模型 `noise_bat_ABCD_model.joblib`，返回合并 payload；供 CLI 与桌面 App 共同调用。`main()` 在此基础上保留交互式路径输入。只做流程串联，算法细节都在各功能模块。
 
 ### demo.py — 轻量演示
 
 从 `results/tables/` 已提交的两个结果表（`acoustic_pulses.csv`、`acoustic_clusters_ABCD.csv`）重建小规模两级模型（随机森林 300/400 棵，与 pipeline 的 600 棵不同，是有意设计），无需原始录音数据即可复现演示。含 argparse CLI：`--input`、`--model`、`--rebuild-model`、`--self-test`。
+
+## 桌面 App（bat_classifier_app.py）
+
+PySide6 窗口程序，四页签，所有耗时操作在后台线程执行、日志回显到底部面板：
+
+| 文件 | 功能 |
+|---|---|
+| `src/bat_classifier/app/settings.py` | 工作区/标签/数据源设置，持久化到 `workspace/app_settings.json`；启动时先写入 `BAT_WORKSPACE` 环境变量再导入库（config 路径在导入期解析） |
+| `src/bat_classifier/app/workers.py` | QThread 工作类（导入数据/训练/预测），stdout 重定向为 Qt 信号 |
+| `src/bat_classifier/app/image_viewer.py` | 结果图像查看：大图对话框（适应窗口/1:1）与"列表+预览"画廊组件 |
+| `src/bat_classifier/app/main_window.py` | 五页签主窗口：①数据来源（选 WAV 文件夹或 zip，导入到 `data/raw`）②模型训练（声型数量 2–6、标签名与描述可编辑、可选诊断图）③预测（选 WAV/文件夹，结果表格预览）④模型管理（中文训练摘要、原始元数据 JSON、模型目录）⑤结果图像（声谱图/脉冲放大图/PCA 图的浏览与大图查看） |
+
+- 运行：`python bat_classifier_app.py`；`--selftest` 离屏自检（供打包验证）。
+- 标签规则：默认 A-D 四类沿用语义归类；其他数量或名称按聚类中心峰值频率从低到高依次分配。
+- 工作区：源码态默认为仓库根目录；打包态为 exe 旁的 `workspace/`，含 `data/raw`、`results`、`models`。
+- 打包：`build_exe.bat`（内部执行 `pyinstaller bat_app.spec --noconfirm` 并对产物跑 `--selftest`），产物 `dist/BatClassifier/BatClassifier.exe`。
 
 ## 入口与测试
 

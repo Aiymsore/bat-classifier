@@ -6,12 +6,27 @@
 
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
-# =========================================================
-# 1. 目录路径
-# =========================================================
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+def _resolve_project_root() -> Path:
+    """项目根目录解析顺序：
+
+    1. 环境变量 BAT_WORKSPACE（桌面 App 指定的自定义工作区）；
+    2. 打包态（PyInstaller）时 exe 所在目录；
+    3. 源码态回退到仓库根目录。
+    """
+    workspace = os.environ.get("BAT_WORKSPACE")
+    if workspace:
+        return Path(workspace).resolve()
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+PROJECT_ROOT = _resolve_project_root()
 BASE_DIR = PROJECT_ROOT
 DATA_DIR = PROJECT_ROOT / "data"
 RAW_DATA_DIR = DATA_DIR / "raw"          # 原始演示录音（WAV）
@@ -88,8 +103,27 @@ CONTOUR_MIN_DB = -35.0         # 可靠频率轮廓的最低能量
 RANDOM_STATE = 42
 
 # =========================================================
-# 5. A-D 声型聚类
+# 5. 声型标签与 A-D 声型聚类
 # =========================================================
+# 声型标签列表（可按需增减，默认 A-D 四类）；
+# N_ACOUSTIC_TYPES 保留为兼容别名。
+ACOUSTIC_TYPE_LABELS = ["A", "B", "C", "D"]
+
+N_ACOUSTIC_TYPES = len(ACOUSTIC_TYPE_LABELS)
+
+
+def validate_labels(labels: list[str]) -> list[str]:
+    """校验声型标签列表：非空、互不相同、可安全用作输出目录名。"""
+    cleaned = [str(label).strip() for label in labels]
+    if not cleaned or any(not label for label in cleaned):
+        raise ValueError("声型标签不能为空。")
+    if len(set(cleaned)) != len(cleaned):
+        raise ValueError(f"声型标签不能重复：{cleaned}")
+    for label in cleaned:
+        if set(label) & set('\\/:*?"<>|'):
+            raise ValueError(f"声型标签含非法字符：{label}")
+    return cleaned
+
 CLUSTER_FEATURE_COLUMNS = [
     "duration_ms",
     "peak_freq_khz",
@@ -103,8 +137,6 @@ CLUSTER_FEATURE_COLUMNS = [
     "track_coverage",
     "max_track_jump_khz",
 ]
-
-N_ACOUSTIC_TYPES = 4
 
 MAX_CLUSTER_PULSES_PER_RECORDING = 150   # 单录音进入聚类的脉冲上限
 REPRESENTATIVE_PULSES_PER_TYPE = 10

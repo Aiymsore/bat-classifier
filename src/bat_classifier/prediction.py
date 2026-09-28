@@ -21,7 +21,11 @@ from .visualization import (
     save_fast_overview_spectrogram,
     save_top_pulse_zoom_grid,
 )
-from .config import ACOUSTIC_TYPE_DESCRIPTIONS, DEMO_PREDICTION_DIR
+from .config import (
+    ACOUSTIC_TYPE_DESCRIPTIONS,
+    ACOUSTIC_TYPE_LABELS,
+    DEMO_PREDICTION_DIR,
+)
 
 if TYPE_CHECKING:
     from sklearn.cluster import KMeans
@@ -37,7 +41,7 @@ def predict_one_demo_wav_two_stage(
     新WAV两级判断：
 
     第一层：noise / bat
-    第二层：仅把bat候选分到A-D
+    第二层：仅把bat候选归入声型标签（默认A-D）
     """
     noise_payload = combined_payload["noise_gate"]
     acoustic_payload = combined_payload["acoustic_types"]
@@ -52,6 +56,14 @@ def predict_one_demo_wav_two_stage(
     )
     acoustic_features = list(
         acoustic_payload["feature_columns"]
+    )
+    labels = list(
+        acoustic_payload.get("labels")
+        or ACOUSTIC_TYPE_LABELS
+    )
+    descriptions = dict(
+        acoustic_payload.get("type_descriptions")
+        or ACOUSTIC_TYPE_DESCRIPTIONS
     )
 
     y, sr = load_audio(audio_path)
@@ -148,7 +160,7 @@ def predict_one_demo_wav_two_stage(
         bat_df[
             "acoustic_type_description"
         ] = bat_df["acoustic_type"].map(
-            ACOUSTIC_TYPE_DESCRIPTIONS
+            lambda label: descriptions.get(label, "")
         )
         bat_df["ABCD_model_agreement"] = (
             kmeans_types == classifier_types
@@ -227,23 +239,23 @@ def predict_one_demo_wav_two_stage(
     if bat_count:
         print(
             f"主要声型：{major_type} "
-            f"（{ACOUSTIC_TYPE_DESCRIPTIONS[major_type]}）"
+            f"（{descriptions.get(major_type, '')}）"
         )
         print(
             f"主要声型占bat脉冲："
             f"{major_type_ratio:.2%}"
         )
-        print("A-D数量：")
+        print("各声型数量：")
         print(
             type_counts.reindex(
-                ["A", "B", "C", "D"],
+                labels,
                 fill_value=0,
             )
         )
     else:
         print(
             "结论：当前候选主要被判为noise，"
-            "没有足够bat脉冲进入A-D分类。"
+            "没有足够bat脉冲进入声型分类。"
         )
 
     print(f"逐片段结果：{output_path}")
@@ -281,7 +293,7 @@ def predict_one_demo_wav_two_stage(
         "prediction_csv": str(output_path),
     }
 
-    for acoustic_type in ["A", "B", "C", "D"]:
+    for acoustic_type in labels:
         count = int(
             type_counts.get(acoustic_type, 0)
         )

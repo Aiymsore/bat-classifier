@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import shutil
 import zipfile
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -49,8 +51,39 @@ from .config import (
 )
 
 
-def prepare_demo_dataset() -> None:
-    """准备用户自己的演示录音数据。"""
+def _clear_raw_data_dir() -> None:
+    """清空原始数据目录内容（带防越界检查），用于切换训练数据来源。"""
+    if not RAW_DATA_DIR.exists():
+        return
+
+    resolved_root = RAW_DATA_DIR.resolve()
+    for item in RAW_DATA_DIR.iterdir():
+        resolved_item = item.resolve()
+        if (
+            resolved_item == resolved_root
+            or resolved_root not in resolved_item.parents
+        ):
+            raise RuntimeError(
+                f"拒绝清理异常数据路径：{resolved_item}"
+            )
+        if item.is_dir():
+            shutil.rmtree(resolved_item)
+        else:
+            item.unlink()
+
+
+def prepare_demo_dataset(
+    source: Path | None = None,
+) -> int:
+    """准备训练用的演示录音数据，返回 WAV 数量。
+
+    source 为 None 时的行为与历史版本一致：
+    data/raw 已有 WAV 则直接使用，否则从 data/ 下的默认压缩包解压。
+
+    source 指定时的行为：
+    - 指向 zip 文件：清空 data/raw 后解压到其中；
+    - 指向文件夹：清空 data/raw 后复制其中的全部 WAV（含子目录）。
+    """
     for directory in (
         RAW_DATA_DIR,
         RESULTS_DIR,
@@ -66,6 +99,42 @@ def prepare_demo_dataset() -> None:
     ):
         directory.mkdir(parents=True, exist_ok=True)
 
+    if source is not None:
+        source = Path(source)
+        if source.is_file() and source.suffix.lower() == ".zip":
+            _clear_raw_data_dir()
+            print(
+                f"正在解压训练数据："
+                f"{source.name} -> {RAW_DATA_DIR.name}"
+            )
+            with zipfile.ZipFile(source, "r") as zf:
+                zf.extractall(RAW_DATA_DIR)
+        elif source.is_dir():
+            wav_files = find_wav_files(source)
+            if not wav_files:
+                raise FileNotFoundError(
+                    f"{source} 中没有找到WAV文件。"
+                )
+            _clear_raw_data_dir()
+            for wav_path in wav_files:
+                destination = RAW_DATA_DIR / wav_path.name
+                shutil.copy2(wav_path, destination)
+            print(
+                f"已从 {source.name} 导入 "
+                f"{len(wav_files)} 个WAV。"
+            )
+        else:
+            raise FileNotFoundError(
+                f"训练数据来源无效（需要 zip 文件或文件夹）：{source}"
+            )
+
+        wav_files = find_wav_files(RAW_DATA_DIR)
+        if not wav_files:
+            raise RuntimeError(
+                "数据源导入完成，但没有找到WAV文件。"
+            )
+        return len(wav_files)
+
     existing_wavs = find_wav_files(
         RAW_DATA_DIR
     )
@@ -74,7 +143,7 @@ def prepare_demo_dataset() -> None:
             f"检测到已有演示数据："
             f"{len(existing_wavs)} 个WAV"
         )
-        return
+        return len(existing_wavs)
 
     zip_path = next(
         (
@@ -113,6 +182,7 @@ def prepare_demo_dataset() -> None:
         f"演示数据准备完成："
         f"{len(wav_files)} 个WAV"
     )
+    return len(wav_files)
 
 
 def create_demo_pulse_rows(
@@ -370,17 +440,27 @@ def create_demo_pulse_rows(
     return rows
 
 
-def build_demo_pulse_table() -> tuple[
+def build_demo_pulse_table(
+    save_diagnostics: bool | None = None,
+) -> tuple[
     pd.DataFrame,
     pd.DataFrame,
 ]:
     """
     对全部录音自动检测、精修并切割脉冲。
 
+    save_diagnostics：是否为每条录音生成概览声谱图与脉冲放大图；
+    None 时沿用 config 的 SAVE_PER_RECORDING_DIAGNOSTICS 默认值。
+
     返回：
     - pulse_df：每个候选脉冲一行；
     - recording_df：每个原始录音一行的检测汇总。
     """
+    use_diagnostics = (
+        SAVE_PER_RECORDING_DIAGNOSTICS
+        if save_diagnostics is None
+        else save_diagnostics
+    )
     wav_files = find_wav_files(RAW_DATA_DIR)
     if not wav_files:
         raise FileNotFoundError(
@@ -466,7 +546,7 @@ def build_demo_pulse_table() -> tuple[
                 for row in current_rows
             )
 
-            if SAVE_PER_RECORDING_DIAGNOSTICS:
+            if use_diagnostics:
                 save_fast_overview_spectrogram(
                     audio_path,
                     y,
