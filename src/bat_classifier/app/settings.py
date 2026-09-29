@@ -22,6 +22,11 @@ DEFAULT_DESCRIPTIONS = {
     "D": "复杂、中间或混合声型",
 }
 
+# ⑥ 已确认物种模型的 uncertain 阈值默认值。
+# 与 config.SPECIES_UNCERTAIN_THRESHOLD 保持一致——本模块不得 import
+# bat_classifier.config（路径在导入期由 BAT_WORKSPACE 决定），故在此重复常量。
+DEFAULT_SPECIES_UNCERTAIN_THRESHOLD = 0.60
+
 
 def default_workspace() -> Path:
     """默认工作区：打包态为 exe 旁的 workspace/，源码态为仓库根目录。"""
@@ -38,6 +43,19 @@ class AppSettings:
         default_factory=lambda: dict(DEFAULT_DESCRIPTIONS)
     )
     data_source: str = ""
+    # ③/④/⑦ 共用：当前选中的两级模型文件路径（models/ 下的某个 .joblib）。
+    # 留空表示用默认模型（② 训练产物 models/noise_bat_ABCD_model.joblib）。
+    active_model_path: str = ""
+    # ⑥ 已确认物种模型：当前选择的模型目录（models/species/<name>）
+    species_model_path: str = ""
+    species_uncertain_threshold: float = DEFAULT_SPECIES_UNCERTAIN_THRESHOLD
+    # 主窗口几何：0 / -1 表示未保存，启动时按屏幕可用区域自适应
+    window_width: int = 0
+    window_height: int = 0
+    window_x: int = -1
+    window_y: int = -1
+    # 底部运行日志面板是否收起
+    log_collapsed: bool = False
 
     @property
     def settings_path(self) -> Path:
@@ -57,6 +75,16 @@ class AppSettings:
             "labels": list(self.labels),
             "type_descriptions": dict(self.type_descriptions),
             "data_source": self.data_source,
+            "active_model_path": self.active_model_path,
+            "species_model_path": self.species_model_path,
+            "species_uncertain_threshold": float(
+                self.species_uncertain_threshold
+            ),
+            "window_width": int(self.window_width),
+            "window_height": int(self.window_height),
+            "window_x": int(self.window_x),
+            "window_y": int(self.window_y),
+            "log_collapsed": bool(self.log_collapsed),
         }
         self.settings_path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
@@ -94,5 +122,23 @@ class AppSettings:
                 }
             if isinstance(payload.get("data_source"), str):
                 settings.data_source = payload["data_source"]
+            if isinstance(payload.get("active_model_path"), str):
+                settings.active_model_path = payload["active_model_path"]
+            if isinstance(payload.get("species_model_path"), str):
+                settings.species_model_path = payload["species_model_path"]
+            threshold = payload.get("species_uncertain_threshold")
+            if isinstance(threshold, (int, float)) and 0.0 < float(threshold) < 1.0:
+                settings.species_uncertain_threshold = float(threshold)
+            for key, attr in (
+                ("window_width", "window_width"),
+                ("window_height", "window_height"),
+                ("window_x", "window_x"),
+                ("window_y", "window_y"),
+            ):
+                value = payload.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    setattr(settings, attr, value)
+            if isinstance(payload.get("log_collapsed"), bool):
+                settings.log_collapsed = payload["log_collapsed"]
 
         return settings

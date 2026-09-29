@@ -37,3 +37,7 @@ data/*.zip
 # Local agent notes / tool caches
 .zcode/
 workspace/
+
+# Local runtime state / test scratch
+.tmp/
+app_settings.json

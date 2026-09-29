@@ -190,6 +190,9 @@ def create_demo_pulse_rows(
     y: np.ndarray,
     sr: int,
     pulses: list[dict[str, float]],
+    separated_dir: Path | None = None,
+    max_pulses: int | None = MAX_REFINED_PULSES_PER_RECORDING,
+    save_separated_audio: bool = True,
 ) -> list[dict[str, float | int | str | bool]]:
     """
     Step6轻量版脉冲建表。
@@ -197,15 +200,25 @@ def create_demo_pulse_rows(
     普通单脉冲只提取特征；若一个时间候选中检测到多条
     同时发声轨迹，则展开成多行，并保存各自的分离WAV。
     这样既保留原来的轻量流程，又能审听分离结果。
+
+    separated_dir：分离分量 WAV 的输出目录（None 保持默认
+    results/audio/separated_pulses/；批量整理传入自己的 run 目录）。
+
+    max_pulses：进入建表的脉冲上限（默认沿用
+    MAX_REFINED_PULSES_PER_RECORDING，供演示/预测/批量整理用）。
+    ⑦ 长录音传 None——**计数绝不被截断**；导出数量由调用方的
+    导出预算另行控制，绝不能影响 detection/计数/叫声率。
+
+    save_separated_audio：是否把分离分量写成 WAV（只影响磁盘输出）。
     """
-    if len(pulses) > MAX_REFINED_PULSES_PER_RECORDING:
+    if max_pulses and len(pulses) > max_pulses:
         pulses = sorted(
             pulses,
             key=lambda pulse: float(
                 pulse.get("snr_db", -999.0)
             ),
             reverse=True,
-        )[:MAX_REFINED_PULSES_PER_RECORDING]
+        )[:max_pulses]
         pulses = sorted(
             pulses,
             key=lambda pulse: float(
@@ -366,7 +379,8 @@ def create_demo_pulse_rows(
 
             pulse_file = ""
             if (
-                SAVE_SEPARATED_PULSE_AUDIO
+                save_separated_audio
+                and SAVE_SEPARATED_PULSE_AUDIO
                 and accepted
                 and bool(
                     component["separation_applied"]
@@ -378,6 +392,7 @@ def create_demo_pulse_rows(
                     int(component["component_id"]),
                     component_audio,
                     sr,
+                    output_dir=separated_dir,
                 )
 
             rows.append(

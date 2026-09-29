@@ -398,14 +398,25 @@ def remove_duplicate_boundary_pulses(
 def detect_and_refine_pulses_chunked(
     y: np.ndarray,
     sr: int,
+    max_windows: int | None = None,
 ) -> tuple[int, list[dict[str, float]], float]:
-    """
-    为原型演示抽取录音的开始、中间、结尾三个窗口进行检测。
+    """长录音抽窗检测与边界精修。
 
-    每个窗口默认6秒。这样60秒录音只分析约18秒，
-    能显著缩短演示运行时间。拿到正式数据库后，可以把
-    MAX_ANALYSIS_WINDOWS_PER_RECORDING 调大，或改为扫描全部录音。
+    分窗策略（窗口时长 DETECTION_CHUNK_SECONDS）：
+    - 不足一个窗口：整段分析；
+    - 不超过 max_windows × 窗口时长：按窗口首尾相接连续覆盖全曲；
+    - 更长：在整条录音上均匀抽 max_windows 个窗口（首、中、尾都采样）。
+
+    默认 max_windows = MAX_ANALYSIS_WINDOWS_PER_RECORDING（演示/预测
+    只分析约 2×4 秒，显著缩短运行时间）。批量整理（⑥ curation）传入
+    CURATION_ANALYSIS_SPAN_S 推导出的更大窗口数，把分析跨度延长到
+    默认 60 秒，窗口之间不重叠部分仍由 remove_duplicate_boundary_pulses
+    兜底去重。
     """
+    if max_windows is None:
+        max_windows = MAX_ANALYSIS_WINDOWS_PER_RECORDING
+    max_windows = max(1, int(max_windows))
+
     chunk_samples = max(
         int(round(DETECTION_CHUNK_SECONDS * sr)),
         1,
@@ -417,7 +428,7 @@ def detect_and_refine_pulses_chunked(
     elif (
         audio_length
         <= chunk_samples
-        * MAX_ANALYSIS_WINDOWS_PER_RECORDING
+        * max_windows
     ):
         overlap_samples = max(
             int(
@@ -463,7 +474,7 @@ def detect_and_refine_pulses_chunked(
             for value in np.linspace(
                 0,
                 last_start,
-                num=MAX_ANALYSIS_WINDOWS_PER_RECORDING,
+                num=max_windows,
             )
         ]
 

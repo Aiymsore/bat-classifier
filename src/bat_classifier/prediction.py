@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 
 from .audio_io import find_wav_files, load_audio
+from .calibration import select_classifier
 from .detection import detect_and_refine_pulses_chunked
 from .features import numeric_feature_frame
 from .noise_gate import apply_noise_gate
@@ -29,7 +30,6 @@ from .config import (
 
 if TYPE_CHECKING:
     from sklearn.cluster import KMeans
-    from sklearn.ensemble import RandomForestClassifier
     from sklearn.preprocessing import StandardScaler
 
 
@@ -48,9 +48,9 @@ def predict_one_demo_wav_two_stage(
 
     scaler: StandardScaler = acoustic_payload["scaler"]
     kmeans: KMeans = acoustic_payload["kmeans"]
-    temporary_model: RandomForestClassifier = (
-        acoustic_payload["temporary_classifier"]
-    )
+    # 分类器优先用校准概率版（CalibratedClassifierCV），
+    # 与 ⑦ 的置信度口径一致；没有校准器则退回临时分类器。
+    temporary_model, _is_calibrated = select_classifier(acoustic_payload)
     mapping: dict[int, str] = (
         acoustic_payload["raw_cluster_to_type"]
     )

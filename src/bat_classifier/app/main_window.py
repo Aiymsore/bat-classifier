@@ -1,4 +1,5 @@
-"""桌面 App 主窗口：数据来源 / 模型训练 / 预测 / 模型管理 四页签。
+"""桌面 App 主窗口：数据来源 / 模型训练 / 预测 / 模型管理 / 结果图像 /
+批量整理与专家标注 / 片段识别与叫声统计 七页签。
 
 底部为共享日志面板，显示后台线程重定向的库内 print 输出。
 耗时操作全部走 workers.py 的 QThread，UI 线程不执行算法。
@@ -9,9 +10,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QStandardItem, QStandardItemModel
+from PySide6.QtCore import QRect, Qt, QUrl
+from PySide6.QtGui import (
+    QDesktopServices,
+    QGuiApplication,
+    QStandardItem,
+    QStandardItemModel,
+)
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -44,9 +51,18 @@ from ..config import (
     SPECTROGRAM_DIR,
     validate_labels,
 )
+from ..model_store import IMPORTED_MODEL_DIR, list_models
+from .curation_tab import CurationTab
 from .image_viewer import ImageGalleryPane
+from .model_picker import ModelPicker
+from .segment_analysis_tab import SegmentAnalysisTab
 from .settings import AppSettings
-from .workers import ImportDataWorker, PredictWorker, TrainingWorker
+from .workers import (
+    CalibrateModelWorker,
+    ImportDataWorker,
+    PredictWorker,
+    TrainingWorker,
+)
 
 SUMMARY_CSV_NAME = "noise_ABCD_prediction_summary.csv"
 
@@ -59,19 +75,22 @@ class MainWindow(QMainWindow):
         self._workers: list[object] = []
 
         self.setWindowTitle("蝙蝠声学分类系统")
-        self.resize(1040, 720)
+        self._apply_window_geometry()
 
         # 日志面板先于页签构建：页签初始化时会写入首条日志。
-        log_group = QGroupBox("运行日志")
-        log_layout = QVBoxLayout()
         self._log_view = QPlainTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setMaximumHeight(150)
-        log_layout.addWidget(self._log_view)
-        clear_button = QPushButton("清空日志")
-        clear_button.clicked.connect(self._log_view.clear)
-        log_layout.addWidget(clear_button, alignment=Qt.AlignRight)
-        log_group.setLayout(log_layout)
+        log_bar = QHBoxLayout()
+        log_bar.addWidget(QLabel("运行日志"))
+        log_bar.addStretch(1)
+        self._log_clear_button = QPushButton("清空")
+        self._log_clear_button.clicked.connect(self._log_view.clear)
+        self._log_toggle_button = QPushButton("收起")
+        self._log_toggle_button.clicked.connect(self._toggle_log)
+        log_bar.addWidget(self._log_clear_button)
+        log_bar.addWidget(self._log_toggle_button)
+        self._set_log_collapsed(bool(self._settings.log_collapsed))
 
         tabs = QTabWidget()
         tabs.addTab(self._build_source_tab(), "① 数据来源")
@@ -79,17 +98,68 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_predict_tab(), "③ 预测")
         tabs.addTab(self._build_model_tab(), "④ 模型管理")
         tabs.addTab(self._build_images_tab(), "⑤ 结果图像")
+        tabs.addTab(self._build_curation_tab(), "⑥ 批量整理与专家标注")
+        self._segment_tab = self._build_segment_tab()
+        tabs.addTab(self._segment_tab, "⑦ 片段识别与叫声统计")
+
+        self._wire_model_pickers()
 
         central = QWidget()
         root_layout = QVBoxLayout(central)
         root_layout.addWidget(tabs, stretch=1)
-        root_layout.addWidget(log_group)
+        root_layout.addLayout(log_bar)
+        root_layout.addWidget(self._log_view)
         self.setCentralWidget(central)
 
         self._append_log(f"工作区：{self._settings.workspace}")
         self._refresh_source_summary()
 
     # ---------------- 共享 ----------------
+
+    def _apply_window_geometry(self) -> None:
+        """优先恢复上次保存的窗口大小/位置；无效则按屏幕可用区域取 90%。"""
+        width = int(self._settings.window_width)
+        height = int(self._settings.window_height)
+        if width > 0 and height > 0:
+            x = int(self._settings.window_x)
+            y = int(self._settings.window_y)
+            rect = QRect(x, y, width, height)
+            screens = QApplication.screens()
+            if x >= 0 and y >= 0 and any(
+                screen.availableGeometry().intersects(rect)
+                for screen in screens
+            ):
+                self.setGeometry(rect)
+                return
+            self.resize(width, height)
+            return
+
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        if available is not None:
+            self.resize(
+                max(960, int(available.width() * 0.9)),
+                max(600, int(available.height() * 0.9)),
+            )
+        else:
+            self.resize(1040, 720)
+
+    def _save_window_geometry(self) -> None:
+        self._settings.window_width = self.width()
+        self._settings.window_height = self.height()
+        self._settings.window_x = self.x()
+        self._settings.window_y = self.y()
+
+    def _toggle_log(self) -> None:
+        collapsed = self._log_view.isVisible()  # 当前可见 → 收起
+        self._set_log_collapsed(collapsed)
+        self._settings.log_collapsed = collapsed
+        self._settings.save()
+
+    def _set_log_collapsed(self, collapsed: bool) -> None:
+        self._log_view.setVisible(not collapsed)
+        self._log_clear_button.setVisible(not collapsed)
+        self._log_toggle_button.setText("展开" if collapsed else "收起")
 
     def _append_log(self, text: str) -> None:
         self._log_view.appendPlainText(text)
@@ -108,6 +178,44 @@ class MainWindow(QMainWindow):
         """有关闭确认需求时由 closeEvent 调用；返回是否仍有任务在跑。"""
         return bool(self._workers)
 
+    # ---------------- 模型选择（③ / ④ / ⑦ 共用） ----------------
+
+    def _model_pickers(self) -> list[ModelPicker]:
+        pickers = [
+            getattr(self, "_predict_picker", None),
+            getattr(self, "_manage_picker", None),
+        ]
+        segment_tab = getattr(self, "_segment_tab", None)
+        if segment_tab is not None:
+            pickers.append(segment_tab.model_picker)
+        return [picker for picker in pickers if picker is not None]
+
+    def _wire_model_pickers(self) -> None:
+        """三处选择器指向同一个“当前使用模型”，任一处改动即同步。"""
+        for picker in self._model_pickers():
+            picker.model_changed.connect(self._on_model_selected)
+
+    def _on_model_selected(self, path: str) -> None:
+        sender = self.sender()
+        self._settings.active_model_path = str(path)
+        self._settings.save()
+        for picker in self._model_pickers():
+            if picker is sender:
+                continue
+            picker.set_path(path)   # 值相同则不发信号，天然不会死循环
+        self._append_log(f"当前使用模型：{path}")
+
+    def refresh_model_pickers(self) -> None:
+        """② 训练完成 / ④ 导入后调用：重扫模型目录并刷新各页状态。"""
+        for picker in self._model_pickers():
+            picker.refresh(picker.current_path_text())
+        segment_tab = getattr(self, "_segment_tab", None)
+        if segment_tab is not None:
+            segment_tab.refresh_models()
+        if getattr(self, "_model_status_label", None) is not None:
+            self._refresh_model_status()
+        self._refresh_model_tab()
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt 命名
         if self.confirm_if_busy():
             answer = QMessageBox.question(
@@ -122,6 +230,9 @@ class MainWindow(QMainWindow):
                 return
             for worker in list(self._workers):
                 worker.wait(100)
+        if QGuiApplication.platformName() != "offscreen":
+            self._save_window_geometry()
+            self._settings.save()
         event.accept()
 
     # ---------------- ① 数据来源 ----------------
@@ -364,6 +475,13 @@ class MainWindow(QMainWindow):
         parts.append("可到“预测”页对新录音分类，“结果图像”页查看PCA图。")
         self._train_summary_label.setText("；".join(parts))
         self._refresh_images_tab()
+        # ② 训练出的模型固定写入 models/noise_bat_ABCD_model.joblib，
+        # 通知 ③/④/⑦ 重扫模型目录（已导入的模型仍在，可继续切换使用）。
+        self.refresh_model_pickers()
+        self._append_log(
+            f"训练产物已就绪：{COMBINED_DEMO_MODEL_PATH.name}"
+            "（③/④/⑦ 中作为默认模型，可与已导入模型互相切换）"
+        )
 
     def _on_task_failed(self, message: str) -> None:
         self._apply_source_button.setEnabled(True)
@@ -377,8 +495,20 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
 
+        layout.addWidget(
+            QLabel("使用模型（② 训练的模型 / 已导入的模型，可随时切换）")
+        )
+        self._predict_picker = ModelPicker(
+            self._settings.active_model_path, log=self._append_log
+        )
+        layout.addWidget(self._predict_picker)
+
         self._model_status_label = QLabel("模型状态：检查中…")
+        self._model_status_label.setWordWrap(True)
         layout.addWidget(self._model_status_label)
+        self._predict_picker.model_changed.connect(
+            lambda _path: self._refresh_model_status()
+        )
         self._refresh_model_status()
 
         path_group = QGroupBox("预测输入")
@@ -418,15 +548,26 @@ class MainWindow(QMainWindow):
         return page
 
     def _refresh_model_status(self) -> None:
-        if COMBINED_DEMO_MODEL_PATH.exists():
-            self._model_status_label.setText(
-                f"模型状态：完整训练模型（{COMBINED_DEMO_MODEL_PATH.name}）"
-            )
-        else:
-            self._model_status_label.setText(
-                "模型状态：未找到完整训练模型。"
-                "请先在“模型训练”页训练；若仓库结果表齐全也可构建演示模型。"
-            )
+        path = self._predict_picker.current_path()
+        if path and path.exists():
+            from ..model_store import inspect_model
+
+            entry = inspect_model(path)
+            if entry.valid:
+                self._model_status_label.setText(
+                    f"模型状态：{entry.display_name}"
+                    f"（{entry.size_mb:.1f} MB，标签："
+                    f"{'、'.join(entry.labels) or '?'}）"
+                )
+            else:
+                self._model_status_label.setText(
+                    f"模型状态：所选模型不可用——{entry.error}"
+                )
+            return
+        self._model_status_label.setText(
+            "模型状态：未找到完整训练模型。"
+            "请先在“② 模型训练”页训练，或用“导入模型文件…”导入现成模型。"
+        )
 
     def _pick_predict_wav(self) -> None:
         chosen, _ = QFileDialog.getOpenFileName(self, "选择WAV", "", "音频 (*.wav)")
@@ -441,8 +582,15 @@ class MainWindow(QMainWindow):
     def _load_combined_payload(self) -> dict:
         import joblib
 
-        if COMBINED_DEMO_MODEL_PATH.exists():
-            return joblib.load(COMBINED_DEMO_MODEL_PATH)
+        from ..model_store import payload_error
+
+        path = self._predict_picker.current_path()
+        if path and path.exists():
+            payload = joblib.load(path)
+            error = payload_error(payload)
+            if error:
+                raise RuntimeError(f"所选模型不可用（{path}）：{error}")
+            return payload
 
         answer = QMessageBox.question(
             self,
@@ -514,16 +662,44 @@ class MainWindow(QMainWindow):
 
         files_group = QGroupBox("模型文件")
         files_layout = QVBoxLayout()
+
+        files_layout.addWidget(
+            QLabel("可用模型（② 训练的模型 / 已导入的模型，可随时切换）")
+        )
+        self._manage_picker = ModelPicker(
+            self._settings.active_model_path, log=self._append_log
+        )
+        self._manage_picker.model_changed.connect(
+            lambda _path: self._refresh_model_tab()
+        )
+        files_layout.addWidget(self._manage_picker)
+
         self._model_files_label = QLabel("")
         self._model_files_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._model_files_label.setWordWrap(True)
         files_layout.addWidget(self._model_files_label)
         files_row = QHBoxLayout()
+        import_button = QPushButton("导入模型文件…")
+        import_button.setToolTip(
+            "把现成的 .joblib 模型复制到 models/imported/，"
+            "之后即可在 ③ 预测 / ⑦ 片段识别中选用；不会覆盖 ② 的训练产物。"
+        )
+        calibrate_button = QPushButton("补校准当前模型…")
+        calibrate_button.setToolTip(
+            "用一份带真值标签的脉冲 CSV，给当前模型补一个 "
+            "CalibratedClassifierCV 校准器（不重训、不覆盖原模型，"
+            "结果另存为 *_calibrated.joblib）。⑦ 的置信度将变为校准概率。"
+        )
         refresh_button = QPushButton("刷新")
         open_button = QPushButton("打开模型目录")
+        import_button.clicked.connect(self._import_model_file)
+        calibrate_button.clicked.connect(self._calibrate_current_model)
         refresh_button.clicked.connect(self._refresh_model_tab)
         open_button.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(MODEL_DIR)))
         )
+        files_row.addWidget(import_button)
+        files_row.addWidget(calibrate_button)
         files_row.addWidget(refresh_button)
         files_row.addWidget(open_button)
         files_row.addStretch(1)
@@ -551,8 +727,94 @@ class MainWindow(QMainWindow):
         self._refresh_model_tab()
         return page
 
+    def _import_model_file(self) -> None:
+        """④ 页面的导入按钮：复制现成模型到 models/imported/ 并刷新列表。"""
+        self._manage_picker.import_interactively()
+        self._refresh_model_tab()
+
+    def _calibrate_current_model(self) -> None:
+        """④ 页面：给当前选中的模型补 CalibratedClassifierCV 校准器。
+
+        只 fit 校准器，不重训、不覆盖原模型；结果另存为
+        models/imported/<名称>_calibrated.joblib，⑦ 的置信度随之变为校准概率。
+        """
+        model_path = self._manage_picker.current_path()
+        if model_path is None or not model_path.exists():
+            QMessageBox.information(
+                self, "提示", "请先在上方选择要补校准的模型。"
+            )
+            return
+
+        csv_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择带真值标签的脉冲 CSV",
+            "",
+            "CSV 文件 (*.csv);;所有文件 (*)",
+        )
+        if not csv_path:
+            return
+
+        output_path = (
+            IMPORTED_MODEL_DIR / f"{model_path.stem}_calibrated.joblib"
+        )
+        answer = QMessageBox.question(
+            self,
+            "补校准",
+            f"模型：{model_path.name}\n标注：{Path(csv_path).name}\n"
+            f"输出：{output_path}\n\n"
+            "只补一个 CalibratedClassifierCV 校准器（按 source_recording "
+            "分组隔离），不重训模型、不覆盖原模型。\n"
+            "数据不足以安全校准时会直接失败，绝不伪造校准概率。\n\n继续？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        worker = CalibrateModelWorker(model_path, Path(csv_path), output_path)
+        worker.done.connect(self._on_calibrate_done)
+        worker.failed.connect(self._on_task_failed)
+        self._track_worker(worker)
+        self._append_log(
+            f"开始补校准：{model_path.name} ← {Path(csv_path).name}"
+        )
+
+    def _on_calibrate_done(self, result: object) -> None:
+        info = dict(result or {})
+        output_path = str(info.get("output_path") or "")
+        calibration = dict(info.get("calibration") or {})
+        self._append_log(
+            f"补校准完成：{output_path}"
+            f"（method={calibration.get('calibration_method') or '?'}, "
+            f"{calibration.get('fold_count') or 0} 折，"
+            f"标签列={info.get('label_column') or '?'}, "
+            f"分组列={info.get('source_column') or '无'}）"
+        )
+        self.refresh_model_pickers()
+        if output_path:
+            for picker in self._model_pickers():
+                picker.set_path(output_path)
+
     def _refresh_model_tab(self) -> None:
-        lines = []
+        lines = ["【可用模型】③ 预测 / ⑦ 片段识别都能选用："]
+        entries = list_models()
+        if not entries:
+            lines.append(
+                "（models/ 下暂无可用模型：请先在 ② 模型训练页训练，"
+                "或点“导入模型文件…”导入现成模型）"
+            )
+        for entry in entries:
+            mark = "✔" if entry.valid else "✘"
+            lines.append(
+                f"{mark} [{entry.origin_text}] {entry.path.name}"
+                f"（{entry.size_mb:.1f} MB）"
+            )
+            lines.append(f"    {entry.path}")
+            if not entry.valid:
+                lines.append(f"    ⚠ 不可用：{entry.error}")
+        lines.append("")
+
+        lines.append("【② 训练伴随文件】")
         for model_path in [
             COMBINED_DEMO_MODEL_PATH,
             CLUSTER_METADATA_JSON,
@@ -649,3 +911,25 @@ class MainWindow(QMainWindow):
         directory = self._gallery_combo.currentData()
         count = self._images_gallery.load_directory(directory)
         self._append_log(f"结果图像：{directory.name} 下找到 {count} 个PNG。")
+
+    # ---------------- ⑥ 批量整理与专家标注 ----------------
+
+    def _build_curation_tab(self) -> QWidget:
+        # 页面逻辑都在 curation_tab.py / curation_review.py，
+        # 主窗口只负责挂载，避免继续膨胀。
+        return CurationTab(
+            log=self._append_log,
+            track_worker=self._track_worker,
+            settings=self._settings,
+        )
+
+    # ---------------- ⑦ 片段识别与叫声统计 ----------------
+
+    def _build_segment_tab(self) -> QWidget:
+        # 页面逻辑都在 segment_analysis_tab.py，算法在 segment_analysis.py，
+        # 主窗口只负责挂载。
+        return SegmentAnalysisTab(
+            log=self._append_log,
+            track_worker=self._track_worker,
+            initial_model_path=self._settings.active_model_path,
+        )

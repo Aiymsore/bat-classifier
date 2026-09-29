@@ -24,6 +24,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 from .audio_io import load_audio
+from .calibration import calibrate_classifier
 from .features import accepted_mask, numeric_feature_frame
 from .visualization import save_pca_plot
 from .config import (
@@ -261,6 +262,69 @@ def _semantic_abcd_mapping(
     return mapping
 
 
+def export_pulse_audio(
+    row: "pd.Series | dict",
+    destination: Path,
+    audio_cache: dict[str, tuple[np.ndarray, int]] | None = None,
+) -> str:
+    """把一个脉冲写到 destination，返回写入路径（相对 BASE_DIR，无法相对时为绝对路径）。
+
+    代表脉冲必须沿用已分离波形（row["pulse_file"]），绝不能再从原始
+    混合录音切一遍把两个声源混回去；只有未发生分离的普通脉冲才回退
+    到按 start_s/end_s 从源录音切割。
+
+    训练页 save_cluster_representatives 与批量整理（curation）的
+    代表样本导出共用此逻辑。audio_cache 由调用方提供以复用录音加载。
+    """
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    cache = (
+        audio_cache if audio_cache is not None else {}
+    )
+
+    pulse_path_text = str(row.get("pulse_file", "") or "")
+    source_path_text = str(row.get("source_path", "") or "")
+
+    separated_source = None
+    if pulse_path_text:
+        separated_source = Path(pulse_path_text)
+        if not separated_source.is_absolute():
+            separated_source = BASE_DIR / separated_source
+
+    if separated_source is not None and separated_source.exists():
+        shutil.copy2(separated_source, destination)
+    elif source_path_text:
+        if source_path_text not in cache:
+            cache[source_path_text] = load_audio(
+                Path(source_path_text)
+            )
+        source_y, source_sr = cache[source_path_text]
+        start_sample = max(
+            0,
+            int(round(float(row["start_s"]) * source_sr)),
+        )
+        end_sample = min(
+            len(source_y),
+            int(round(float(row["end_s"]) * source_sr)),
+        )
+        segment = source_y[start_sample:end_sample]
+        if len(segment) < 32:
+            return ""
+        sf.write(
+            destination,
+            segment.astype(np.float32),
+            source_sr,
+            subtype="PCM_16",
+        )
+    else:
+        return ""
+
+    try:
+        return str(destination.relative_to(BASE_DIR))
+    except ValueError:
+        return str(destination)
+
+
 def save_cluster_representatives(
     data: pd.DataFrame,
     scaled_features: np.ndarray,
@@ -338,7 +402,6 @@ def save_cluster_representatives(
                 row.get("pulse_file", "")
             )
 
-            copied_path = ""
             source_path_text = str(
                 row.get("source_path", "")
             )
@@ -349,82 +412,13 @@ def save_cluster_representatives(
                 ".wav"
             )
 
-            separated_source = None
-            if pulse_path_text:
-                separated_source = Path(
-                    pulse_path_text
-                )
-                if not separated_source.is_absolute():
-                    separated_source = (
-                        BASE_DIR / separated_source
-                    )
-
-            if (
-                separated_source is not None
-                and separated_source.exists()
-            ):
-                # 代表脉冲必须沿用已分离波形，不能再从原始
-                # 混合录音切一遍，否则会把两个声源重新混回去。
-                shutil.copy2(
-                    separated_source,
-                    destination,
-                )
-                copied_path = str(
-                    destination.relative_to(BASE_DIR)
-                )
-            elif source_path_text:
-                if (
-                    source_path_text
-                    not in audio_cache
-                ):
-                    source_audio_path = Path(
-                        source_path_text
-                    )
-                    audio_cache[
-                        source_path_text
-                    ] = load_audio(
-                        source_audio_path
-                    )
-
-                source_y, source_sr = (
-                    audio_cache[
-                        source_path_text
-                    ]
-                )
-                start_sample = max(
-                    0,
-                    int(
-                        round(
-                            float(row["start_s"])
-                            * source_sr
-                        )
-                    ),
-                )
-                end_sample = min(
-                    len(source_y),
-                    int(
-                        round(
-                            float(row["end_s"])
-                            * source_sr
-                        )
-                    ),
-                )
-                segment = source_y[
-                    start_sample:end_sample
-                ]
-
-                if len(segment) >= 32:
-                    sf.write(
-                        destination,
-                        segment.astype(np.float32),
-                        source_sr,
-                        subtype="PCM_16",
-                    )
-                    copied_path = str(
-                        destination.relative_to(
-                            BASE_DIR
-                        )
-                    )
+            # 代表脉冲必须沿用已分离波形（export_pulse_audio 内部保证），
+            # 未分离的普通脉冲才回退为从源录音按时间切割。
+            copied_path = export_pulse_audio(
+                row,
+                destination,
+                audio_cache,
+            )
 
             representative_rows.append(
                 {
@@ -855,6 +849,33 @@ def cluster_acoustic_types(
         )
     )
 
+    # 概率校准（⑦ 置信度用）：按 source_recording 分组隔离；
+    # 数据不足则不校准，置信度退回未校准的模型支持度（绝不伪造）。
+    calibration_result = calibrate_classifier(
+        feature_frame,
+        data["acoustic_type"],
+        groups=(
+            data["source_file"]
+            if "source_file" in data.columns
+            else None
+        ),
+        base=temporary_model,
+    )
+    calibrated_model = calibration_result["classifier"]
+    calibration_info = calibration_result["info"]
+    if calibration_info["is_calibrated"]:
+        print(
+            f"[概率校准] ⑦ 置信度已校准："
+            f"CalibratedClassifierCV(method="
+            f"{calibration_info['calibration_method']})，"
+            f"{calibration_info['fold_count']} 折，录音分组隔离。"
+        )
+    else:
+        print(
+            "[概率校准] ⑦ 置信度未校准（数据不足以安全校准）："
+            + "；".join(calibration_info.get("warnings") or ["未知原因"])
+        )
+
     payload = {
         "scaler": scaler,
         "kmeans": kmeans,
@@ -862,6 +883,10 @@ def cluster_acoustic_types(
         "temporary_classifier": (
             temporary_model
         ),
+        "calibrated_classifier": (
+            calibrated_model
+        ),
+        "calibration": calibration_info,
         "raw_cluster_to_type": mapping,
         "feature_columns": (
             CLUSTER_FEATURE_COLUMNS
@@ -935,6 +960,7 @@ def cluster_acoustic_types(
         "temporary_classifier_consistency": (
             consistency
         ),
+        "calibration": calibration_info,
         "evaluation_note": note,
         "pca_explained_variance_ratio": pca_ratios,
         "model_file": str(

@@ -753,11 +753,16 @@ def save_separated_pulse(
     component_id: int,
     component_audio: np.ndarray,
     sr: int,
+    output_dir: Path | None = None,
 ) -> str:
-    """只把确实发生拆分的分量写盘，并返回相对路径。"""
-    output_dir = (
-        SEPARATED_PULSE_DIR / audio_path.stem
-    )
+    """只把确实发生拆分的分量写盘，并返回相对路径。
+
+    output_dir 为 None 时保持历史行为（写入 results/audio/separated_pulses/）；
+    批量整理（curation）传入自己的 run 目录以避免污染训练输出。
+    """
+    if output_dir is None:
+        output_dir = SEPARATED_PULSE_DIR / audio_path.stem
+    output_dir = Path(output_dir)
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
@@ -773,7 +778,10 @@ def save_separated_pulse(
         sr,
         subtype="PCM_16",
     )
-    return str(output_path.relative_to(BASE_DIR))
+    try:
+        return str(output_path.relative_to(BASE_DIR))
+    except ValueError:
+        return str(output_path)
 
 
 def clear_separated_pulses_for_source(
