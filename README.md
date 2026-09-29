@@ -235,10 +235,10 @@ PySide6 窗口程序，七页签，所有耗时操作在后台线程执行、日
 | `src/bat_classifier/app/curation_tab.py` | ⑥ 页面：任务创建/参数/进度/导出，串起扫描→处理→聚类与审核工作台 |
 | `src/bat_classifier/app/curation_review.py` | 专家审核工作台：Cluster 列表 / 代表样本列表 / 声谱图+声学参数 / 标注表单 / 纯度提示 |
 | `src/bat_classifier/app/segment_analysis_tab.py` | ⑦ 页面：输入选择 + 模型状态与模型切换/导入（临时声型显式提示）+ 参数 + 进度 + 片段/总体统计表 + 选中片段详情/声谱图 |
-| `src/bat_classifier/app/ui_utils.py` | 布局小工具 `make_scrollable`：把长表单区包进 QScrollArea，内容超出可视高度时按需出现滚动条（⑥/⑦ 使用；表格等工作台自带滚动条、留在滚动区外） |
+| `src/bat_classifier/app/ui_utils.py` | 布局小工具 `make_scrollable`：把内容包进 QScrollArea，内容超出可视高度时按需出现滚动条（⑥ 整页滚动：表单+审核工作台+模型对照结果同一滚动区；⑦ 上半表单滚动 + 下半结果区固定） |
 
 - 运行：`python bat_classifier_app.py`；`--selftest` 离屏自检（供打包验证）。
-- 小屏幕适配：⑥/⑦ 上半部分表单区可滚动、与下半部分工作台/结果区用纵向分隔条分栏；底部运行日志可"收起/展开"；窗口大小与位置、日志折叠状态记入 `app_settings.json`，下次启动恢复（无效位置时按屏幕可用区域取 90%）。
+- 小屏幕适配：⑥ **整页滚动**（表单 + 审核工作台 + 模型对照结果在同一个滚动区，屏幕再矮也滚轮滚到底）；⑦ 上半部分表单区可滚动、与下半部分结果区用纵向分隔条分栏；底部运行日志可"收起/展开"；窗口大小与位置、日志折叠状态记入 `app_settings.json`，下次启动恢复（无效位置时按屏幕可用区域取 90%）。
 - 标签规则：默认 A-D 四类沿用语义归类；其他数量或名称按聚类中心峰值频率从低到高依次分配。
 - 工作区：源码态默认为仓库根目录；打包态为 exe 旁的 `workspace/`，含 `data/raw`、`results`、`models`。
 - 打包：`build_exe.bat`（内部执行 `pyinstaller bat_app.spec --noconfirm` 并对产物跑 `--selftest`），产物 `dist/BatClassifier/BatClassifier.exe`。

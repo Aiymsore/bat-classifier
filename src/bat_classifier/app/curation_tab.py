@@ -12,7 +12,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,7 +25,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
-    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -64,8 +62,12 @@ class CurationTab(QWidget):
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
 
-        # 上半部分表单区：内容高过可视高度时自动出现滚动条（小屏幕可滚）。
+        # 整页滚动：⑥ 页面全部内容（数据集/参数/进度/导出/划分/物种模型 +
+        # 审核工作台 + 模型对照结果 + 标注表单）都进同一个滚动区——
+        # 屏幕再矮也能一路滚到底，"模型对照结果"不会被挤出可视区域。
+        # 列表/表格等自带滚动条的部件留在各面板内部，外层滚动条按需出现。
         form = QWidget()
         form_layout = QVBoxLayout(form)
         form_layout.setContentsMargins(0, 0, 0, 0)
@@ -205,24 +207,17 @@ class CurationTab(QWidget):
         form_layout.addWidget(self._species_panel)
 
         # ---- 4. 审核工作台 ----
-        # 固定在下方占满剩余高度（表格/声谱图自带滚动条，不进外层滚动区）。
+        # 与表单一起进整页滚动区；面板内部的列表/表格/声谱图自带滚动条。
         self._review = CurationReviewPane(
             log=self._log,
             add_samples_handler=self._request_add_samples,
             run_compare_handler=self._run_model_compare,
         )
         self._review.setMinimumHeight(220)
+        form_layout.addWidget(self._review, stretch=1)
 
-        splitter = QSplitter(Qt.Vertical)
-        splitter.setChildrenCollapsible(False)
         form_scroll = make_scrollable(form)
-        form_scroll.setMinimumHeight(200)
-        splitter.addWidget(form_scroll)
-        splitter.addWidget(self._review)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([480, 320])
-        root.addWidget(splitter, stretch=1)
+        root.addWidget(form_scroll, stretch=1)
 
     @staticmethod
     def _count_spin(value: int) -> QSpinBox:

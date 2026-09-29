@@ -99,6 +99,7 @@ class ModelComparisonPane(QGroupBox):
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionMode(QTableWidget.NoSelection)
         self._table.verticalHeader().setVisible(False)
+        self._table.setMinimumHeight(150)  # 4 行 + 表头完整可见（整页滚动时不被压扁）
         self._table.setMaximumHeight(190)
         layout.addWidget(self._table)
 
@@ -119,6 +120,7 @@ class ModelComparisonPane(QGroupBox):
         layout.addLayout(detail_row)
 
         self._detail_list = QListWidget()
+        self._detail_list.setMinimumHeight(120)  # 逐样本列表至少可读（可滚）
         self._detail_list.itemDoubleClicked.connect(self._on_item_double_clicked)
         layout.addWidget(self._detail_list, stretch=1)
 

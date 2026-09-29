@@ -181,6 +181,7 @@ class CurationReviewPane(QWidget):
         splitter.addWidget(detail_group)
 
         splitter.setSizes([210, 330, 470])
+        splitter.setMinimumHeight(260)  # 工作台三栏在整页滚动中保持可读高度
         root.addWidget(splitter, stretch=1)
 
         # ---- 纯度提示 ----
