@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import shutil
 import warnings
 from pathlib import Path
 
@@ -17,6 +16,7 @@ import soundfile as sf
 from scipy.signal import find_peaks
 
 from .audio_io import ultrasonic_band_mask
+from .harmonics import group_harmonic_tracks, harmonic_component_metadata
 from .config import (
     BASE_DIR,
     CORE_PADDING_MS,
@@ -32,6 +32,7 @@ from .config import (
     SEPARATION_MAX_PEAKS_PER_FRAME,
     SEPARATION_MAX_TRACK_GAP_FRAMES,
     SEPARATION_MAX_TRACK_JUMP_KHZ,
+    SEPARATION_MAX_WIN_LENGTH,
     SEPARATION_MIN_FREQ_GAP_KHZ,
     SEPARATION_MIN_SECONDARY_RELATIVE_DB,
     SEPARATION_MIN_TEMPORAL_OVERLAP,
@@ -90,6 +91,8 @@ def _tracks_are_harmonic_duplicates(
 def _compare_simultaneous_tracks(
     primary: dict[str, object],
     candidate: dict[str, object],
+    *,
+    reject_basic_harmonics: bool = True,
 ) -> tuple[bool, float, float]:
     """
     判断两条轨迹是否真正在时间上重叠且频率可分辨。
@@ -150,9 +153,9 @@ def _compare_simultaneous_tracks(
         median_gap_khz
         >= SEPARATION_MIN_FREQ_GAP_KHZ
         and resolvable_ratio >= 0.60
-        and not _tracks_are_harmonic_duplicates(
-            primary,
-            candidate,
+        and (
+            not reject_basic_harmonics
+            or not _tracks_are_harmonic_duplicates(primary, candidate)
         )
     )
     return independent, overlap_ratio, median_gap_khz
@@ -406,6 +409,9 @@ def _link_spectral_peak_tracks(
 def separate_simultaneous_pulse_components(
     pulse_y: np.ndarray,
     sr: int,
+    *,
+    window_mode: str = "fixed",
+    harmonic_grouping_mode: str = "basic",
 ) -> list[dict[str, object]]:
     """
     将一个时间候选展开为一条或多条同时发声的近频脉冲。
@@ -413,6 +419,10 @@ def separate_simultaneous_pulse_components(
     只有检测到至少两条可靠、重叠且非谐波的轨迹时才修改
     波形；否则直接返回原波形，避免对普通单脉冲造成失真。
     """
+    if window_mode not in {"fixed", "adaptive"}:
+        raise ValueError("分离窗模式必须是 fixed 或 adaptive。")
+    if harmonic_grouping_mode not in {"basic", "enhanced"}:
+        raise ValueError("谐波分组模式必须是 basic 或 enhanced。")
     unchanged = _unchanged_component(pulse_y, 1.0)
     if (
         not ENABLE_SIMULTANEOUS_SEPARATION
@@ -420,10 +430,20 @@ def separate_simultaneous_pulse_components(
     ):
         return [unchanged]
 
-    win_length = min(
-        SEPARATION_WIN_LENGTH,
-        len(pulse_y),
-    )
+    base_win_length = min(SEPARATION_WIN_LENGTH, len(pulse_y))
+    if window_mode == "adaptive" and len(pulse_y) > SEPARATION_WIN_LENGTH:
+        # 保留至少约 3 个分析窗，避免把整条短叫声压成一帧；
+        # 根据候选长度逐级延长窗，最多到 1024 点。
+        target = max(1, len(pulse_y) // 3)
+        adaptive_win_length = 2 ** int(np.floor(np.log2(target)))
+        win_length = min(
+            len(pulse_y),
+            SEPARATION_MAX_WIN_LENGTH,
+            SEPARATION_N_FFT,
+            max(SEPARATION_WIN_LENGTH, adaptive_win_length),
+        )
+    else:
+        win_length = base_win_length
     if win_length < 64:
         return [unchanged]
 
@@ -465,6 +485,12 @@ def separate_simultaneous_pulse_components(
     if len(tracks) < 2:
         return [unchanged]
 
+    if harmonic_grouping_mode == "enhanced":
+        tracks = group_harmonic_tracks(tracks)
+        if len(tracks) == 1:
+            unchanged.update(harmonic_component_metadata(tracks[0]))
+            return [unchanged]
+    reject_basic_harmonics = harmonic_grouping_mode == "basic"
     primary = tracks[0]
     primary_power = max(
         float(primary["total_power"]),
@@ -499,6 +525,7 @@ def separate_simultaneous_pulse_components(
             _compare_simultaneous_tracks(
                 primary,
                 candidate,
+                reject_basic_harmonics=reject_basic_harmonics,
             )
         )
         if not independent:
@@ -508,6 +535,7 @@ def separate_simultaneous_pulse_components(
             _compare_simultaneous_tracks(
                 selected,
                 candidate,
+                reject_basic_harmonics=reject_basic_harmonics,
             )[0]
             for selected in selected_tracks[1:]
         )
@@ -548,46 +576,28 @@ def separate_simultaneous_pulse_components(
         ),
     )
 
-    for component_index, track in enumerate(
-        selected_tracks
-    ):
-        track_frames = np.asarray(
-            track["frames"],
-            dtype=int,
-        )
-        active_frames = (
-            (frame_numbers >= int(track_frames[0]))
-            & (frame_numbers <= int(track_frames[-1]))
-        )
-        interpolated_frequency = (
-            _track_frequency_at_frames(
-                track,
-                frame_numbers,
+    for component_index, track in enumerate(selected_tracks):
+        # 谐波与主轨迹共用一个分量掩码；基本模式仅保留原轨迹。
+        for member in track.get("_harmonic_members", [track]):
+            track_frames = np.asarray(member["frames"], dtype=int)
+            active_frames = (
+                (frame_numbers >= int(track_frames[0]))
+                & (frame_numbers <= int(track_frames[-1]))
             )
-        )
-        distance = (
-            frequencies[:, None]
-            - interpolated_frequency[None, :]
-        )
-        gaussian = np.exp(
-            -0.5 * (distance / sigma_hz) ** 2
-        ).astype(np.float32)
-
-        track_power = np.interp(
-            frame_numbers.astype(float),
-            track_frames.astype(float),
-            np.asarray(track["powers"], dtype=float),
-        )
-        track_power /= max(
-            float(np.max(track_power)),
-            1e-18,
-        )
-        gaussian *= np.sqrt(
-            np.maximum(track_power, 1e-6)
-        )[None, :].astype(np.float32)
-        gaussian[:, ~active_frames] = 0.0
-        gaussian[~frequency_mask, :] = 0.0
-        component_weights[component_index] = gaussian
+            interpolated_frequency = _track_frequency_at_frames(member, frame_numbers)
+            distance = frequencies[:, None] - interpolated_frequency[None, :]
+            gaussian = np.exp(-0.5 * (distance / sigma_hz) ** 2).astype(np.float32)
+            track_power = np.interp(
+                frame_numbers.astype(float),
+                track_frames.astype(float),
+                np.asarray(member["powers"], dtype=float),
+            )
+            track_power /= max(float(np.max(track_power)), 1e-18)
+            gaussian *= np.sqrt(np.maximum(track_power, 1e-6))[None, :].astype(np.float32)
+            gaussian[:, ~active_frames] = 0.0
+            gaussian[~frequency_mask, :] = 0.0
+            np.maximum(component_weights[component_index], gaussian,
+                       out=component_weights[component_index])
 
     weight_sum = np.sum(
         component_weights,
@@ -626,10 +636,10 @@ def separate_simultaneous_pulse_components(
             length=len(pulse_y),
         ).astype(np.float32)
 
-        track_frames = np.asarray(
-            track["frames"],
-            dtype=int,
-        )
+        track_frames = np.unique(np.concatenate([
+            np.asarray(member["frames"], dtype=int)
+            for member in track.get("_harmonic_members", [track])
+        ]))
         start_sample = max(
             0,
             int(track_frames[0])
@@ -670,6 +680,7 @@ def separate_simultaneous_pulse_components(
                 _compare_simultaneous_tracks(
                     track,
                     other,
+                    reject_basic_harmonics=reject_basic_harmonics,
                 )
                 for other in selected_tracks[1:]
             ]
@@ -741,6 +752,7 @@ def separate_simultaneous_pulse_components(
                 "separation_confidence": (
                     separation_confidence
                 ),
+                **harmonic_component_metadata(track),
             }
         )
 
@@ -758,7 +770,7 @@ def save_separated_pulse(
     """只把确实发生拆分的分量写盘，并返回相对路径。
 
     output_dir 为 None 时保持历史行为（写入 results/audio/separated_pulses/）；
-    批量整理（curation）传入自己的 run 目录以避免污染训练输出。
+    分析时传入本次 run 目录，以隔离不同运行的音频输出。
     """
     if output_dir is None:
         output_dir = SEPARATED_PULSE_DIR / audio_path.stem
@@ -782,29 +794,6 @@ def save_separated_pulse(
         return str(output_path.relative_to(BASE_DIR))
     except ValueError:
         return str(output_path)
-
-
-def clear_separated_pulses_for_source(
-    audio_path: Path,
-) -> None:
-    """重建训练表前清理该录音旧分量，避免参数变化后残留文件。"""
-    output_dir = (
-        SEPARATED_PULSE_DIR / audio_path.stem
-    )
-    if not output_dir.exists():
-        return
-
-    resolved_root = SEPARATED_PULSE_DIR.resolve()
-    resolved_output = output_dir.resolve()
-    if (
-        resolved_output == resolved_root
-        or resolved_root
-        not in resolved_output.parents
-    ):
-        raise RuntimeError(
-            f"拒绝清理异常分离目录：{resolved_output}"
-        )
-    shutil.rmtree(resolved_output)
 
 
 def _unchanged_component(

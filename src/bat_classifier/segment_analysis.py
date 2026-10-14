@@ -1,40 +1,9 @@
-"""⑦ 片段识别与叫声统计（上游：WAV 片段或整条超长录音；下游：片段级统计 CSV/JSON）。
-
-业务语义（务必区分）：
-- 统计单位是“一次声学 call / pulse”：WAV 片段内部可能包含 N 次独立叫声；
-  3 小时以上（未来整夜）的整条长录音也可直接分析（流式 chunk 管线，
-  内存与文件总时长无关，见 segment_stream.py）。
-
-两个独立任务（绝不混淆）：
-- Task A 分类：这一段是哪种蝙蝠？——复用**已训练好的确定模型**（pulse-level），
-  不重新训练、不重新 KMeans、不用 Cluster 代替物种。
-- Task B 计数：这一段内部有几次叫声？——复用 detection.py 的
-  detect/refine/去重/质量链，保留的独立 pulse 数即叫声数。
-
-因为当前“确定模型”是 pulse-level（一个 pulse → 一个 label），
-所以对片段内每个 pulse 分别预测，再按片段聚合：
-  每段 → 检测 N 个 pulse → 逐 pulse 分类 → 统计各类别叫声次数 → 片段汇总。
-
-调用链（本模块完全脱离 Qt，可单独测试）：
-  analyze_segment_folder
-    → 每个 WAV → analyze_segment
-        → segment_stream 流式 chunk 管线（chunk+overlap 覆盖全长、跨块去重、
-          保守快筛、有限并行、增量落盘 + checkpoint/断点续跑）
-          每 chunk：detect_pulses + refine_all_pulses + create_demo_pulse_rows
-        → _finalize_chunk_rows（noise/bat 门控 + 逐 pulse 分类 + 不确定标记）
-        → 按片段聚合 label_counts / major_label / purity
-    → summarize_segment_results（片段汇总 + 总体类别统计）
-
-科研语义：本功能统计的是“声学检测到的 call 数量”，
-不代表蝙蝠个体数量。Species A calls = 20 表示模型识别出 20 次
-Species A 类型的声学 call，不等于这里有 20 只 Species A 蝙蝠。
-速率分母 = 有效监测总时长（valid_monitoring_duration_s）：
-静音快筛只是计算优化，被跳过的 chunk 仍算在监测时间内。
-"""
+"""① 流式模板匹配与逐 pulse/片段统计；统计声学叫声数，不代表个体数。"""
 
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -44,19 +13,9 @@ import numpy as np
 import pandas as pd
 
 from .audio_io import find_wav_files
-from .calibration import (
-    CALIBRATED_PROBABILITY,
-    MODEL_SUPPORT,
-    describe_calibration,
-    select_classifier,
-)
 from .config import (
-    ACOUSTIC_TYPE_LABELS,
-    COMBINED_DEMO_MODEL_PATH,
     SEGMENT_ANALYSIS_DIR,
-    SEGMENT_CHECKPOINT_EVERY_CHUNKS,
     SEGMENT_FIGURE_SUBDIR,
-    SEGMENT_LOW_CONFIDENCE_ACTION,
     SEGMENT_MAX_INMEMORY_ROWS,
     SEGMENT_MAX_PULSE_WAV_EXPORTS,
     SEGMENT_MIN_CONFIDENCE,
@@ -65,12 +24,13 @@ from .config import (
     SEGMENT_SEPARATED_SUBDIR,
     SEGMENT_STREAM_CHUNK_SECONDS,
     SEGMENT_STREAM_OVERLAP_SECONDS,
-    SEGMENT_UNAVAILABLE_LABEL,
-    SEGMENT_UNCERTAIN_LABEL,
     TARGET_SAMPLE_RATE,
 )
-from .features import numeric_feature_frame
-from .noise_gate import apply_noise_gate
+from .template_matching import (
+    classify_template_rows,
+    describe_template_model,
+    is_template_model,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -81,252 +41,51 @@ class SegmentAnalysisConfig:
     """片段识别与叫声统计的可调参数（UI 可覆盖默认值）。"""
 
     min_confidence: float = SEGMENT_MIN_CONFIDENCE
-    uncertain_label: str = SEGMENT_UNCERTAIN_LABEL
-    unavailable_label: str = SEGMENT_UNAVAILABLE_LABEL
-    # 低于置信度时："uncertain" 标记为不确定；"keep" 保留模型原标签
-    low_confidence_action: str = SEGMENT_LOW_CONFIDENCE_ACTION
-    # 是否只统计通过质量筛选（accepted）的有效 pulse
-    use_quality_filter: bool = True
     # 是否把每个 pulse 切成 WAV（segments/<id>/<id>__pNNN.wav）
     save_pulse_audio: bool = True
     # 是否生成片段声谱图（figures/<id>.png）
     save_figures: bool = True
+    # 是否为每个分类结果（含 unknown）生成独立声谱图
+    save_pulse_spectrograms: bool = True
+    # merged: 同一候选事件共图；separate: 每个独立分量一图（谐波随分量）。
+    pulse_spectrogram_mode: str = "merged"
+    # 同时分量分离窗：fixed 保持原 256 点；adaptive 对较长 pulse 延长到 512/1024 点。
+    separation_window_mode: str = "fixed"
+    # 谐波判定：basic 仅使用旧的 2/3 倍率；enhanced 加入逐帧轨迹和包络一致性。
+    harmonic_grouping_mode: str = "enhanced"
+    # 独立声谱图在叫声前后保留的上下文（毫秒）。默认严格按 pulse 边界，
+    # 避免把相邻叫声混进当前 pulse；需要背景时再显式调大这个参数。
+    pulse_spectrogram_context_ms: float = 0.0
     mixed_purity_threshold: float = SEGMENT_MIXED_PURITY_THRESHOLD
+    # 低于最低相似度时的未知类别名称。
+    template_unknown_label: str = "unknown"
 
     def validate(self) -> "SegmentAnalysisConfig":
         self.min_confidence = float(self.min_confidence)
         if not (0.0 <= self.min_confidence <= 1.0):
-            raise ValueError("最低置信度必须在 0~1 之间。")
-        if self.low_confidence_action not in {"uncertain", "keep"}:
-            raise ValueError("低于置信度处理必须是 uncertain 或 keep。")
-        self.use_quality_filter = bool(self.use_quality_filter)
+            raise ValueError("最低相似度必须在 0~1 之间。")
         self.save_pulse_audio = bool(self.save_pulse_audio)
         self.save_figures = bool(self.save_figures)
+        self.save_pulse_spectrograms = bool(self.save_pulse_spectrograms)
+        if self.pulse_spectrogram_mode not in {"merged", "separate"}:
+            raise ValueError("声谱图输出方式必须是 merged 或 separate。")
+        self.separation_window_mode = str(self.separation_window_mode).strip().lower()
+        if self.separation_window_mode not in {"fixed", "adaptive"}:
+            raise ValueError("分离窗模式必须是 fixed 或 adaptive。")
+        self.harmonic_grouping_mode = str(self.harmonic_grouping_mode).strip().lower()
+        if self.harmonic_grouping_mode not in {"basic", "enhanced"}:
+            raise ValueError("谐波分组模式必须是 basic 或 enhanced。")
+        self.pulse_spectrogram_context_ms = float(self.pulse_spectrogram_context_ms)
+        if self.pulse_spectrogram_context_ms < 0.0:
+            raise ValueError("逐声波声谱图上下文不能小于 0 毫秒。")
+        self.template_unknown_label = str(self.template_unknown_label).strip()
+        if not self.template_unknown_label:
+            raise ValueError("模板未知类别名称不能为空。")
         return self
 
 
 # ---------------------------------------------------------------------------
-# 模型加载与描述（复用现有模型文件，不新建模型管理系统）
-# ---------------------------------------------------------------------------
-def load_classification_model(
-    model_path: Path | None = None,
-) -> dict | None:
-    """加载已训练好的确定模型（combined two-stage payload）。
-
-    只读取已有模型文件，绝不在此训练。找不到返回 None（进入仅计数模式）。
-    """
-    import joblib
-
-    path = Path(model_path) if model_path else COMBINED_DEMO_MODEL_PATH
-    if not path.exists():
-        return None
-    payload = joblib.load(path)
-    if not isinstance(payload, dict):
-        return None
-    return payload
-
-
-def describe_model(
-    combined_payload: dict | None,
-    model_path: Path | str | None = None,
-) -> dict:
-    """返回模型状态描述，供 UI 显示与 run_metadata 记录。
-
-    model_path：本次实际加载的模型文件（可由 ③/⑦ 的模型选择器指定）；
-    不传则回退到默认的 ② 训练产物路径。
-
-    is_temporary_acoustic_model：当前部署的是 KMeans 临时声型（A-D）
-    模型而非专家确认物种模型时为 True，UI 必须显式提示。
-    supports_probability：分类器是否具备 predict_proba（决定置信度是否可信可用）。
-    is_calibrated / calibration_method / probability_kind / calibration_note：
-    置信度是不是 CalibratedClassifierCV 的校准概率；未校准时 UI 必须明示
-    “置信度未校准（模型支持度）”，绝不把原始 predict_proba 冒充校准概率。
-    """
-    if not combined_payload:
-        return {
-            "loaded": False,
-            "labels": [],
-            "feature_columns": [],
-            "is_temporary_acoustic_model": False,
-            "supports_probability": False,
-            "is_calibrated": False,
-            "calibration_method": "",
-            "probability_kind": MODEL_SUPPORT,
-            "calibration_note": "",
-            "calibration_warnings": [],
-            "model_path": str(model_path or COMBINED_DEMO_MODEL_PATH),
-            "warning": "未检测到可用分类模型，仅可运行叫声检测与计数。",
-        }
-
-    acoustic = combined_payload.get("acoustic_types") or {}
-    labels = [str(label) for label in (acoustic.get("labels") or [])]
-    feature_columns = [
-        str(column) for column in (acoustic.get("feature_columns") or [])
-    ]
-    classifier, _is_calibrated = select_classifier(acoustic)
-    supports_probability = hasattr(classifier, "predict_proba")
-    calibration = describe_calibration(acoustic)
-
-    # 现有确定模型带 temporary_classifier + raw_cluster_to_type + kmeans，
-    # 这是“KMeans 临时声型（默认 A-D）模型”的特征，不是专家确认物种模型。
-    is_temporary = (
-        "temporary_classifier" in acoustic
-        or "raw_cluster_to_type" in acoustic
-        or labels == list(ACOUSTIC_TYPE_LABELS)
-    )
-
-    warning = str(acoustic.get("warning") or "")
-    if is_temporary:
-        warning = (
-            "当前模型为临时声型模型（A-D 声学相似类型），"
-            "不是专家确认物种模型。"
-        )
-
-    return {
-        "loaded": True,
-        "labels": labels or list(ACOUSTIC_TYPE_LABELS),
-        "feature_columns": feature_columns,
-        "is_temporary_acoustic_model": bool(is_temporary),
-        "supports_probability": bool(supports_probability),
-        "is_calibrated": bool(calibration["is_calibrated"]),
-        "calibration_method": str(calibration["calibration_method"] or ""),
-        "probability_kind": str(calibration["probability_kind"]),
-        "calibration_note": str(calibration["calibration_note"] or ""),
-        "calibration_warnings": list(calibration["warnings"] or []),
-        "model_path": str(model_path or COMBINED_DEMO_MODEL_PATH),
-        "warning": warning,
-    }
-
-
-# ---------------------------------------------------------------------------
-# 逐 pulse 分类（复用现有推理链：特征顺序 + StandardScaler + classifier + metadata）
-# ---------------------------------------------------------------------------
-def classify_pulse_rows(
-    bat_df: pd.DataFrame,
-    acoustic_payload: dict,
-    config: SegmentAnalysisConfig,
-) -> pd.DataFrame:
-    """对每个 bat pulse 独立预测 label + confidence，并标记 uncertain。
-
-    严格复用训练时的推理链，绝不自己重新拼 X：
-    - 特征顺序取 acoustic_payload["feature_columns"]（= CLUSTER_FEATURE_COLUMNS）；
-    - 数值清洗用 numeric_feature_frame，NaN 行剔除；
-    - 分类器用**未缩放**特征 predict / predict_proba（与 prediction.py 一致）；
-    - **置信度优先取校准概率**：模型带 calibrated_classifier（CalibratedClassifierCV）
-      时用它出 predict / predict_proba，confidence_kind = calibrated_probability；
-      否则退回临时分类器的原始 predict_proba，confidence_kind = model_support
-      （未校准的模型支持度，不能当“预测正确的概率”读）；
-    - StandardScaler + KMeans 仅用于对照声型（kmeans_label / model_agreement）。
-
-    返回的 DataFrame 新增列：raw_label、predicted_label、confidence、is_uncertain、
-    confidence_kind、kmeans_label、model_agreement。
-    """
-    features = list(acoustic_payload["feature_columns"])
-    labels = [str(label) for label in (acoustic_payload.get("labels") or [])]
-    scaler = acoustic_payload.get("scaler")
-    kmeans = acoustic_payload.get("kmeans")
-    classifier, is_calibrated = select_classifier(acoustic_payload)
-    mapping = dict(acoustic_payload.get("raw_cluster_to_type") or {})
-    confidence_kind = (
-        CALIBRATED_PROBABILITY if is_calibrated else MODEL_SUPPORT
-    )
-
-    df = bat_df.copy()
-    if df.empty:
-        df["raw_label"] = []
-        df["predicted_label"] = []
-        df["confidence"] = []
-        df["is_uncertain"] = []
-        df["confidence_kind"] = []
-        df["kmeans_label"] = []
-        df["model_agreement"] = []
-        return df
-
-    # 1) 特征顺序严格按 metadata，数值清洗
-    df[features] = numeric_feature_frame(df, features)
-    valid_mask = df[features].notna().all(axis=1)
-    df = df.loc[valid_mask].copy()
-    if df.empty:
-        for column in (
-            "raw_label",
-            "predicted_label",
-            "confidence",
-            "is_uncertain",
-            "confidence_kind",
-            "kmeans_label",
-            "model_agreement",
-        ):
-            df[column] = []
-        return df
-
-    # 2) 分类器：未缩放特征（与训练/prediction 一致）；置信度优先校准概率
-    raw_labels = np.asarray(classifier.predict(df[features]))
-
-    supports_probability = hasattr(classifier, "predict_proba")
-    if supports_probability:
-        probabilities = classifier.predict_proba(df[features])
-        class_to_index = {
-            str(class_name): index
-            for index, class_name in enumerate(classifier.classes_)
-        }
-        confidence = np.asarray(
-            [
-                probabilities[row, class_to_index[str(label)]]
-                for row, label in enumerate(raw_labels)
-            ],
-            dtype=float,
-        )
-    else:
-        confidence = np.full(len(df), np.nan)
-
-    # 3) StandardScaler + KMeans 仅作对照（不作为最终物种标签）
-    kmeans_labels = np.full(len(df), "", dtype=object)
-    if scaler is not None and kmeans is not None:
-        try:
-            scaled = scaler.transform(df[features])
-            raw_clusters = kmeans.predict(scaled)
-            kmeans_labels = np.asarray(
-                [
-                    mapping.get(int(cluster), "")
-                    for cluster in raw_clusters
-                ],
-                dtype=object,
-            )
-        except Exception:  # noqa: BLE001 - 对照失败不影响主分类
-            kmeans_labels = np.full(len(df), "", dtype=object)
-
-    # 4) 不确定标记 + 最终标签
-    predicted: list[str] = []
-    is_uncertain: list[bool] = []
-    for index, label in enumerate(raw_labels):
-        label_text = str(label)
-        conf = confidence[index]
-        uncertain = False
-        if supports_probability and config.low_confidence_action == "uncertain":
-            if not np.isfinite(conf) or conf < config.min_confidence:
-                uncertain = True
-        if uncertain:
-            predicted.append(config.uncertain_label)
-        else:
-            predicted.append(label_text)
-        is_uncertain.append(uncertain)
-
-    df["raw_label"] = [str(label) for label in raw_labels]
-    df["predicted_label"] = predicted
-    df["confidence"] = confidence
-    df["is_uncertain"] = is_uncertain
-    df["confidence_kind"] = confidence_kind
-    df["kmeans_label"] = kmeans_labels
-    df["model_agreement"] = [
-        str(raw) == str(kmeans)
-        for raw, kmeans in zip(df["raw_label"], kmeans_labels)
-    ]
-    _ = labels  # labels 用于聚合阶段，这里仅为可读性保留
-    return df
-
-
-# ---------------------------------------------------------------------------
-# 单片段分析
+# 模板匹配统计
 # ---------------------------------------------------------------------------
 def _empty_label_counts(
     labels: list[str],
@@ -401,109 +160,44 @@ def _replay_checkpoint_rows(
 
 def _finalize_chunk_rows(
     analysis_rows: list[dict],
-    combined_payload: dict | None,
-    noise_payload: dict | None,
-    acoustic_payload: dict | None,
-    config: "SegmentAnalysisConfig",
-    unavailable_label: str,
+    config: SegmentAnalysisConfig,
     pulse_id_start: int,
+    template_payload: dict,
 ) -> tuple[list[dict], int, int]:
-    """噪声门控 + 逐 pulse 分类（按 chunk 小批量，语义与旧实现完全一致）。
-
-    分类模型/特征/阈值不变；只是把“整段一次 predict”拆成“每 chunk 一次
-    小批量 predict”（64~数百行），低内存高吞吐，结果逐行一致。
-
-    返回 (result_rows, noise_count, next_pulse_id)。
-    """
-    result_rows: list[dict] = []
-    if combined_payload is None:
-        # 仅计数模式：无可用分类模型，标签 = unavailable
-        for index, row in enumerate(analysis_rows):
-            result_rows.append(
-                {
-                    **row,
-                    "pulse_id": f"p{pulse_id_start + index:03d}",
-                    "stage1_prediction": "bat",
-                    "prob_bat": None,
-                    "raw_label": unavailable_label,
-                    "predicted_label": unavailable_label,
-                    "confidence": None,
-                    "is_uncertain": False,
-                    "kmeans_label": "",
-                    "model_agreement": False,
-                }
-            )
-        return result_rows, 0, pulse_id_start + len(analysis_rows)
-
-    # noise/bat 门控
-    stage1_df = apply_noise_gate(pd.DataFrame(analysis_rows), noise_payload)
-    noise_count = 0
-    bat_df = stage1_df
-    if not stage1_df.empty:
-        bat_df = stage1_df.loc[
-            stage1_df["stage1_prediction"] == "bat"
-        ].copy()
-        noise_df = stage1_df.loc[
-            stage1_df["stage1_prediction"] == "noise"
-        ].copy()
-        noise_count = int(len(noise_df))
-        # noise 行保留在明细中，但不进入物种分类
-        for _, noise_row in noise_df.iterrows():
-            result_rows.append(
-                {
-                    **noise_row.to_dict(),
-                    "pulse_id": "",
-                    "raw_label": "",
-                    "predicted_label": "noise",
-                    "confidence": (
-                        float(noise_row.get("prob_bat"))
-                        if noise_row.get("prob_bat") is not None
-                        else None
-                    ),
-                    "is_uncertain": False,
-                    # noise 行的 confidence 是第一层门控的 prob_bat，
-                    # 既不是物种置信度也不是校准概率，明确标注来源。
-                    "confidence_kind": "noise_gate_prob_bat",
-                    "kmeans_label": "",
-                    "model_agreement": False,
-                }
-            )
-
-    classified_count = 0
-    if not bat_df.empty:
-        classified_df = classify_pulse_rows(
-            bat_df, acoustic_payload, config
-        )
-        for position, (_, row) in enumerate(classified_df.iterrows()):
-            confidence_value = row.get("confidence")
-            result_rows.append(
-                {
-                    **row.to_dict(),
-                    "pulse_id": f"p{pulse_id_start + position:03d}",
-                    "confidence": (
-                        float(confidence_value)
-                        if confidence_value is not None
-                        and np.isfinite(confidence_value)
-                        else None
-                    ),
-                }
-            )
-        classified_count = int(len(classified_df))
-    return result_rows, noise_count, pulse_id_start + classified_count
+    """所有可提取特征的 pulse 按模板匹配，一条声波只归入一个类别。"""
+    frame = classify_template_rows(
+        pd.DataFrame(analysis_rows), template_payload,
+        min_similarity=config.min_confidence,
+        unknown_label=config.template_unknown_label,
+    )
+    rows = []
+    for position, (_, row) in enumerate(frame.iterrows()):
+        value = row.get("confidence")
+        rows.append({
+            **row.to_dict(),
+            "pulse_id": f"p{pulse_id_start + position:03d}",
+            "confidence": float(value) if value is not None and np.isfinite(value) else None,
+        })
+    return rows, 0, pulse_id_start + len(rows)
 
 
 PULSE_ROW_EXTRA_KEYS = (
     "pulse_id",
-    "stage1_prediction",
-    "prob_bat",
-    "prob_noise",
     "raw_label",
     "predicted_label",
     "confidence",
     "confidence_kind",
     "is_uncertain",
-    "kmeans_label",
-    "model_agreement",
+    "template_label",
+    "template_match_score",
+    "template_match_distance",
+    "template_file",
+    "pulse_spectrogram_file",
+    "event_id",
+    "pulse_spectrogram_mode",
+    "pulse_spectrogram_status",
+    "merged_spectrogram_file",
+    "component_spectrogram_file",
 )
 
 
@@ -563,9 +257,7 @@ class _SegmentAccumulator:
     ) -> None:
         self.raw_candidate_count += int(raw_candidate_count)
         self.candidate_call_count += len(pulse_rows)
-        self.valid_call_count += sum(
-            1 for row in pulse_rows if bool(row.get("accepted"))
-        )
+        self.valid_call_count += len(pulse_rows)
         self.noise_count += int(noise_count)
         self.next_pulse_id = int(next_pulse_id)
 
@@ -689,7 +381,7 @@ def _export_batch_pulse_audio(
 
     **导出上限只影响磁盘文件数量**：行已全部进入计数/分类/CSV。
     """
-    from .clustering import export_pulse_audio
+    from .pulse_export import export_pulse_audio
 
     stem = wav_path.stem
     exported = 0
@@ -719,18 +411,187 @@ def _export_batch_pulse_audio(
     return exported, truncated
 
 
+def _safe_output_component(value: str, fallback: str = "unknown") -> str:
+    """把类别/片段名转换为可跨平台使用的目录或文件名片段。"""
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", str(value)).strip(" .")
+    return text or fallback
+
+
+def _export_batch_pulse_spectrograms(
+    result_rows: list[dict],
+    *,
+    segment_id: str,
+    spectrogram_root: Path,
+    read_y: np.ndarray,
+    read_start_s: float,
+    context_ms: float = 0.0,
+    mode: str = "merged",
+    component_audio: dict[tuple[int, int], np.ndarray] | None = None,
+) -> int:
+    """按事件合并或按独立分量保存 PNG，返回实际成功图片张数。
+
+    ``read_y`` 是当前流式 chunk 的预处理音频，行中的时间是整段 WAV 的
+    全局秒数，因此这里先转换为 chunk 内索引。噪声不进入逐类图片；
+    ``unknown`` 与所有具体类别都按最终 predicted_label 保存。
+    分量音频仅在当前 chunk 存活，不放入特征表；可信谐波随所属分量共图。
+    """
+    if not result_rows or len(read_y) < 32:
+        return 0
+
+    from .visualization import save_pulse_spectrogram
+
+    root = Path(spectrogram_root)
+    root.mkdir(parents=True, exist_ok=True)
+    segment_name = _safe_output_component(segment_id, "segment")
+    exported = 0
+    sample_rate = int(TARGET_SAMPLE_RATE)
+    context_samples = max(
+        0,
+        int(round(max(0.0, float(context_ms)) / 1000.0 * sample_rate)),
+    )
+
+    if mode not in {"merged", "separate"}:
+        raise ValueError("无效的声谱图输出方式。")
+    groups: dict[str, list[dict]] = {}
+    for row in result_rows:
+        label = str(row.get("predicted_label", "")).strip()
+        if not label or label == "noise":
+            continue
+        event_id = str(row.get("event_id") or row.get("pulse_id"))
+        key = event_id if mode == "merged" else str(row.get("pulse_id"))
+        groups.setdefault(key, []).append(row)
+        row["pulse_spectrogram_mode"] = mode
+        row["pulse_spectrogram_status"] = "pending"
+        row["merged_spectrogram_file"] = ""
+        row["component_spectrogram_file"] = ""
+
+    for group in groups.values():
+        row = group[0]
+        label = str(row["predicted_label"])
+        try:
+            start_s = min(float(item.get("candidate_start_s", item["start_s"]))
+                          if mode == "merged" else float(item["start_s"]) for item in group)
+            end_s = max(float(item.get("candidate_end_s", item["end_s"]))
+                        if mode == "merged" else float(item["end_s"]) for item in group)
+            pulse_id_text = str(row.get("pulse_id", "")).strip()
+            pulse_id = int(
+                pulse_id_text[1:]
+                if pulse_id_text.lower().startswith("p")
+                else (pulse_id_text or exported + 1)
+            )
+        except (TypeError, ValueError):
+            continue
+
+        start_sample = max(
+            0,
+            int(round((start_s - float(read_start_s)) * sample_rate))
+            - context_samples,
+        )
+        end_sample = min(
+            len(read_y),
+            int(round((end_s - float(read_start_s)) * sample_rate))
+            + context_samples,
+        )
+        if end_sample - start_sample < 32:
+            continue
+        pulse_y = np.asarray(read_y[start_sample:end_sample], dtype=np.float32)
+
+        status = "merged" if mode == "merged" else "single_or_unresolved"
+        if mode == "separate" and bool(row.get("separation_applied")):
+            audio_key = (int(row["candidate_id"]), int(row["component_id"]))
+            separated_audio = (component_audio or {}).get(audio_key)
+            if separated_audio is None or len(separated_audio) < 32:
+                row["pulse_spectrogram_status"] = "component_audio_unavailable"
+                continue
+            pulse_y = np.asarray(separated_audio, dtype=np.float32)
+            status = "separated"
+
+        # 合并图覆盖所有有效分量；分开图保留所属分量的谐波频率范围。
+        frequency_values: list[float] = []
+        for item in group:
+            for field in ("f05_khz", "f95_khz", "start_freq_khz", "end_freq_khz", "peak_freq_khz"):
+                value = float(item.get(field, float("nan")))
+                if np.isfinite(value):
+                    frequency_values.append(value)
+            harmonic_frequencies = item.get("harmonic_frequencies_khz", [])
+            if isinstance(harmonic_frequencies, str):
+                harmonic_frequencies = json.loads(harmonic_frequencies or "[]")
+            frequency_values.extend(float(value) for value in harmonic_frequencies
+                                    if np.isfinite(float(value)))
+        limits = None
+        if frequency_values and (mode == "merged" or int(row.get("harmonic_group_size", 1)) > 1):
+            from .visualization import AUTO_FOCUS_PADDING_HZ, AUTO_FOCUS_MIN_SPAN_HZ
+            from .config import LOW_FREQ_HZ, HIGH_FREQ_HZ
+            low = min(frequency_values) * 1000 - AUTO_FOCUS_PADDING_HZ
+            high = max(frequency_values) * 1000 + AUTO_FOCUS_PADDING_HZ
+            center = (low + high) / 2
+            span = max(high - low, AUTO_FOCUS_MIN_SPAN_HZ)
+            limits = (max(LOW_FREQ_HZ, center - span / 2),
+                      min(HIGH_FREQ_HZ, sample_rate / 2, center + span / 2))
+
+        labels = {str(item["predicted_label"]) for item in group}
+        safe_label = _safe_output_component(label) if len(labels) == 1 else "_merged"
+        suffix = "__merged" if mode == "merged" else ""
+        filename = f"{segment_name}__p{pulse_id:05d}{suffix}.png"
+        destination = root / safe_label / filename
+        title_lines = [
+            f"{segment_id} | {'Merged event' if mode == 'merged' else 'Pulse'} | t={start_s:.3f}-{end_s:.3f} s",
+        ]
+        for item in group:
+            title_lines.append(
+                f"{item['pulse_id']} | {item['predicted_label']} | "
+                f"duration={float(item.get('duration_ms', 0)):.2f} ms | "
+                f"peak={float(item.get('peak_freq_khz', 0)):.1f} kHz | "
+                f"start/end={float(item.get('start_freq_khz', 0)):.1f}/{float(item.get('end_freq_khz', 0)):.1f} kHz"
+            )
+        if mode == "separate" and status == "single_or_unresolved":
+            harmonic_count = int(row.get("harmonic_group_size", 1))
+            if harmonic_count > 1:
+                status = "harmonic_family"
+                title_lines.append(f"Harmonic family ({harmonic_count} bands, one call)")
+            else:
+                title_lines.append("Original pulse (single call or unresolved overlap)")
+        try:
+            ok = save_pulse_spectrogram(
+                pulse_y,
+                sample_rate,
+                destination,
+                title_lines,
+                frequency_limits_hz=limits,
+                component_annotations=[(float(item.get("peak_freq_khz", 0)),
+                                        f"{item['pulse_id']} {item['predicted_label']}")
+                                       for item in group] if len(group) > 1 else None,
+            )
+        except Exception:  # noqa: BLE001 - 单个图片失败不影响统计
+            ok = False
+        if ok:
+            relative = (Path(root.name) / safe_label / filename).as_posix()
+            for item in group:
+                item["pulse_spectrogram_file"] = relative
+                item["merged_spectrogram_file" if mode == "merged" else "component_spectrogram_file"] = relative
+                item["pulse_spectrogram_status"] = status
+            exported += 1
+        else:
+            for item in group:
+                item["pulse_spectrogram_status"] = "render_failed"
+    return exported
+
+
 def analyze_segment(
     wav_path: Path | str,
-    combined_payload: dict | None,
     config: SegmentAnalysisConfig,
     *,
     segment_output_dir: Path | None = None,
     separated_dir: Path | None = None,
     figure_path: Path | None = None,
+    pulse_spectrogram_root: Path | None = None,
     chunk_progress: "Callable[[dict], None] | None" = None,
     should_stop: "Callable[[], bool] | None" = None,
     resume: bool | None = None,
     max_workers: int | None = None,
+    template_payload: dict | None = None,
+    on_pulse_batch: Callable[[list[dict], object], None] | None = None,
+    save_intermediate_audio: bool = True,
 ) -> dict:
     """分析单个 WAV（几分钟片段，或 3 小时以上整条长录音）。
 
@@ -744,6 +605,7 @@ def analyze_segment(
     - resume=True 时从断点续跑（校验文件身份 + 跨块去重防重复计数）。
 
     chunk_progress：块级进度回调；should_stop：取消标记。
+    on_pulse_batch：分类后回调（② 筛选导出复用），分量音频仅在本块有效。
     """
     from .segment_stream import (
         ChunkCheckpoint,
@@ -762,18 +624,12 @@ def analyze_segment(
     config = config.validate()
     wav_path = Path(wav_path)
 
-    acoustic_payload = (
-        combined_payload.get("acoustic_types") if combined_payload else None
-    )
-    noise_payload = (
-        combined_payload.get("noise_gate") if combined_payload else None
-    )
-    labels = (
-        [str(label) for label in (acoustic_payload or {}).get("labels") or []]
-        or (list(ACOUSTIC_TYPE_LABELS) if acoustic_payload else [config.unavailable_label])
-    )
-    uncertain_label = config.uncertain_label
-    unavailable_label = config.unavailable_label
+    if not is_template_model(template_payload):
+        raise ValueError("请提供有效的模板声波模型。")
+    labels = [str(label) for label in template_payload.get("labels") or []]
+    if not labels:
+        raise ValueError("模板模型没有可用类别。")
+    uncertain_label = config.template_unknown_label
 
     # ---- 流式探测：绝不整条载入（内存与文件总长无关）----
     total_frames, orig_sr, duration_s = probe_audio(wav_path)
@@ -794,12 +650,18 @@ def analyze_segment(
         stats=stats,
         total_samples=total_frames,
         separated_dir=separated_dir,
-        save_separated_audio=True,
+        save_separated_audio=save_intermediate_audio,
+        template_matching=template_payload is not None,
+        separation_window_mode=config.separation_window_mode,
+        harmonic_grouping_mode=config.harmonic_grouping_mode,
+        retain_component_audio=(on_pulse_batch is not None or
+                                (config.save_pulse_spectrograms and config.pulse_spectrogram_mode == "separate")),
     )
     accumulator = _SegmentAccumulator(labels, uncertain_label, config)
 
     # ---- checkpoint / 断点续跑 ----
     checkpoint = None
+    state = None
     resumed = False
     start_at_s = 0.0
     seen_row_keys: set[tuple[float, float]] = set()
@@ -809,6 +671,22 @@ def analyze_segment(
         )
         state = checkpoint.load_resumable() if resume else None
         if state is not None:
+            if state.get("pulse_processing_version") != 3:
+                raise ValueError("脉冲处理方式已更新，请重新开始分析。")
+            expected_modes = {
+                "window": config.separation_window_mode,
+                "harmonics": config.harmonic_grouping_mode,
+            }
+            previous_modes = state.get(
+                "separation_modes", {"window": "fixed", "harmonics": "basic"}
+            )
+            if previous_modes != expected_modes:
+                raise ValueError(
+                    "分离窗或谐波处理模式已改变，不能混用旧断点结果。"
+                    "请重新开始分析以生成独立的对照结果。"
+                )
+            if state.get("pulse_spectrogram_mode", "legacy") != config.pulse_spectrogram_mode:
+                raise ValueError("声谱图输出方式已改变，请重新开始分析，避免混用旧断点图片。")
             accumulator.from_state(dict(state.get("accumulator") or {}))
             start_at_s = float(state.get("processed_until_s") or 0.0)
             resumed = True
@@ -837,6 +715,7 @@ def analyze_segment(
     export_budget = int(SEGMENT_MAX_PULSE_WAV_EXPORTS)
     exported_count = 0
     export_truncated = False
+    exported_pulse_spectrogram_count = int(state.get("exported_pulse_spectrogram_count", 0)) if state else 0
     prev_tail_rows: list[dict] = []
     batch_offset = int(accumulator.rows_total)
     processed_until_s = float(start_at_s)
@@ -902,20 +781,32 @@ def analyze_segment(
             ]
         prev_tail_rows = [dict(row) for row in rows[-8:]]
 
-        accepted_rows = [row for row in rows if bool(row.get("accepted"))]
-        analysis_rows = accepted_rows if config.use_quality_filter else rows
-
-        # 小批量分类（模型语义完全不变）
+        # 按块进行模板匹配
         result_rows, noise_count, next_id = _finalize_chunk_rows(
-            analysis_rows,
-            combined_payload,
-            noise_payload,
-            acoustic_payload,
+            rows,
             config,
-            unavailable_label,
             accumulator.next_pulse_id,
+            template_payload,
         )
         result_rows.sort(key=lambda r: float(r.get("start_s", 0.0)))
+        if on_pulse_batch is not None:
+            on_pulse_batch(result_rows, batch)
+
+        if (
+            config.save_pulse_spectrograms
+            and pulse_spectrogram_root is not None
+            and batch.read_y is not None
+        ):
+            exported_pulse_spectrogram_count += _export_batch_pulse_spectrograms(
+                result_rows,
+                segment_id=wav_path.stem,
+                spectrogram_root=pulse_spectrogram_root,
+                read_y=batch.read_y,
+                read_start_s=batch.spec.read_start_s,
+                context_ms=config.pulse_spectrogram_context_ms,
+                mode=config.pulse_spectrogram_mode,
+                component_audio=batch.component_audio,
+            )
 
         # 导出 pulse WAV（导出上限只影响磁盘；计数已在上面全量累计）
         if config.save_pulse_audio and segment_output_dir is not None:
@@ -953,6 +844,7 @@ def analyze_segment(
         )
         batch_offset += len(result_rows)
         batch.read_y = None
+        batch.component_audio.clear()
         processed_until_s = batch.spec.coverage_end_s
 
         # 增量落盘 + checkpoint（长任务不等全跑完才第一次写结果）
@@ -963,7 +855,14 @@ def analyze_segment(
             checkpoint.save(
                 {
                     "status": "in_progress",
+                    "pulse_processing_version": 3,
+                    "pulse_spectrogram_mode": config.pulse_spectrogram_mode,
+                    "exported_pulse_spectrogram_count": exported_pulse_spectrogram_count,
                     "file_identity": _checkpoint_identity(wav_path),
+                    "separation_modes": {
+                        "window": config.separation_window_mode,
+                        "harmonics": config.harmonic_grouping_mode,
+                    },
                     "processed_until_s": processed_until_s,
                     "accumulator": accumulator.to_state(),
                     "recording_duration_s": recording_duration_s,
@@ -1023,7 +922,14 @@ def analyze_segment(
             checkpoint.save(
                 {
                     "status": "cancelled",
+                    "pulse_processing_version": 3,
+                    "pulse_spectrogram_mode": config.pulse_spectrogram_mode,
+                    "exported_pulse_spectrogram_count": exported_pulse_spectrogram_count,
                     "file_identity": _checkpoint_identity(wav_path),
+                    "separation_modes": {
+                        "window": config.separation_window_mode,
+                        "harmonics": config.harmonic_grouping_mode,
+                    },
                     "processed_until_s": processed_until_s,
                     "accumulator": accumulator.to_state(),
                     "recording_duration_s": recording_duration_s,
@@ -1080,7 +986,7 @@ def analyze_segment(
         "pulse_rows": accumulator.rows,
         "pulse_rows_truncated": accumulator.rows_truncated,
         "pulse_file_map": accumulator.pulse_file_map,
-        # ---- 长录音口径（⑦ 流式）----
+        # ---- 长录音口径（① 流式）----
         "recording_duration_s": recording_duration_s,
         "valid_monitoring_duration_s": valid_monitoring_duration_s,
         "failed_duration_s": failed_duration_s,
@@ -1090,12 +996,12 @@ def analyze_segment(
         "overlap_seconds": float(SEGMENT_STREAM_OVERLAP_SECONDS),
         "exported_pulse_count": int(exported_count),
         "export_truncated": bool(export_truncated),
+        "exported_pulse_spectrogram_count": int(
+            exported_pulse_spectrogram_count
+        ),
         "resumed": bool(resumed),
+        "pulse_spectrogram_mode": config.pulse_spectrogram_mode,
     }
-
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -1129,7 +1035,7 @@ def _failed_segment_result(
         "pulse_rows": [],
         "pulse_rows_truncated": False,
         "pulse_file_map": {},
-        # ---- 长录音口径（⑦ 流式）----
+        # ---- 长录音口径（① 流式）----
         "recording_duration_s": 0.0,
         "valid_monitoring_duration_s": 0.0,
         "failed_duration_s": 0.0,
@@ -1139,6 +1045,7 @@ def _failed_segment_result(
         "overlap_seconds": float(SEGMENT_STREAM_OVERLAP_SECONDS),
         "exported_pulse_count": 0,
         "export_truncated": False,
+        "exported_pulse_spectrogram_count": 0,
         "resumed": False,
     }
 
@@ -1250,7 +1157,6 @@ def summarize_segment_results(
 
 def analyze_segment_folder(
     input_path: Path,
-    combined_payload: dict | None,
     config: SegmentAnalysisConfig,
     *,
     output_root: Path | None = None,
@@ -1258,8 +1164,8 @@ def analyze_segment_folder(
     chunk_progress: Callable[[dict], None] | None = None,
     on_segment_done: Callable[[dict], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
-    model_path: Path | str | None = None,
     resume: bool | None = None,
+    template_payload: dict | None = None,
 ) -> dict:
     """批量分析文件夹/单个 WAV 的所有片段，写独立输出目录并返回汇总。
 
@@ -1271,6 +1177,29 @@ def analyze_segment_folder(
     """
     config = config.validate()
     input_path = Path(input_path)
+    if not is_template_model(template_payload):
+        raise ValueError("请提供有效的模板声波模型。")
+    if resume and output_root is not None:
+        from .segment_stream import find_resumable_checkpoints
+
+        expected_modes = {
+            "window": config.separation_window_mode,
+            "harmonics": config.harmonic_grouping_mode,
+        }
+        for state_path in find_resumable_checkpoints(Path(output_root)):
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if state.get("pulse_processing_version") != 3:
+                raise ValueError("脉冲处理方式已更新，请重新开始分析。")
+            previous_modes = state.get(
+                "separation_modes", {"window": "fixed", "harmonics": "basic"}
+            )
+            if previous_modes != expected_modes:
+                raise ValueError(
+                    "分离窗或谐波处理模式已改变，不能混用旧断点结果。"
+                    "请重新开始分析以生成独立的对照结果。"
+                )
+            if state.get("pulse_spectrogram_mode", "legacy") != config.pulse_spectrogram_mode:
+                raise ValueError("声谱图输出方式已改变，请重新开始分析，避免混用旧断点图片。")
 
     if input_path.is_file():
         wav_files = (
@@ -1298,16 +1227,23 @@ def analyze_segment_folder(
         run_dir = Path(output_root)
     segments_dir = run_dir / SEGMENT_PULSE_SUBDIR
     figures_dir = run_dir / SEGMENT_FIGURE_SUBDIR
+    pulse_spectrogram_dir = run_dir / "pulse_spectrograms"
     separated_dir = run_dir / SEGMENT_SEPARATED_SUBDIR
-    for directory in (run_dir, segments_dir, figures_dir, separated_dir):
+    for directory in (
+        run_dir,
+        segments_dir,
+        figures_dir,
+        pulse_spectrogram_dir,
+        separated_dir,
+    ):
         directory.mkdir(parents=True, exist_ok=True)
 
-    model_info = describe_model(combined_payload, model_path=model_path)
-    if model_info["loaded"]:
-        labels = model_info["labels"] or list(ACOUSTIC_TYPE_LABELS)
-    else:
-        labels = [config.unavailable_label]
-    uncertain_label = config.uncertain_label
+    model_info = describe_template_model(template_payload)
+    labels = model_info["labels"]
+    uncertain_label = config.template_unknown_label
+    from .template_matching import save_template_model
+    template_model_path = run_dir / "template_model.json"
+    save_template_model(template_payload, template_model_path)
 
     segment_results: list[dict] = []
     total = len(wav_files)
@@ -1324,14 +1260,15 @@ def analyze_segment_folder(
         try:
             result = analyze_segment(
                 wav_path,
-                combined_payload,
-                config,
+                    config,
                 segment_output_dir=segment_output_dir,
                 separated_dir=separated_dir,
                 figure_path=figure_path,
+                pulse_spectrogram_root=pulse_spectrogram_dir,
                 chunk_progress=chunk_progress,
                 should_stop=should_stop,
                 resume=resume,
+                template_payload=template_payload,
             )
         except Exception as error:  # noqa: BLE001 - 失败隔离
             result = _failed_segment_result(wav_path, f"{type(error).__name__}: {error}")
@@ -1360,13 +1297,25 @@ def analyze_segment_folder(
         "raw_label",
         "confidence",
         "is_uncertain",
-        "stage1_prediction",
-        "accepted",
-        "peak_freq_khz",
+            "peak_freq_khz",
         "start_freq_khz",
         "end_freq_khz",
         "snr_db",
         "pulse_file",
+        "template_label",
+        "template_match_score",
+        "template_match_distance",
+        "template_file",
+        "pulse_spectrogram_file",
+        "event_id",
+        "pulse_spectrogram_mode",
+        "pulse_spectrogram_status",
+        "merged_spectrogram_file",
+        "component_spectrogram_file",
+        "harmonic_grouping_mode",
+        "harmonic_group_size",
+        "harmonic_frequencies_khz",
+        "harmonic_evidence",
     ]
     for result in segment_results:
         rows_iter: list[dict] = list(result.get("pulse_rows", []))
@@ -1426,6 +1375,12 @@ def analyze_segment_folder(
         "total_bat_calls": int(
             sum(r.get("detected_call_count", 0) for r in segment_results)
         ),
+        "total_pulse_spectrograms": int(
+            sum(
+                r.get("exported_pulse_spectrogram_count", 0)
+                for r in segment_results
+            )
+        ),
         "total_recording_duration_s": round(
             float(sum(r.get("recording_duration_s", 0.0) for r in segment_results)),
             3,
@@ -1454,7 +1409,7 @@ def analyze_segment_folder(
         "model": model_info,
         "warning": (
             "统计的是声学检测到的 call 数量，不是蝙蝠个体数量；"
-            "标签为模型输出（当前为临时声型 A-D 时不是专家确认物种）。"
+            "模板类别来自人工确认的模板文件名。"
         ),
         "output_files": {
             "segment_summary": "segment_summary.csv",
@@ -1462,6 +1417,12 @@ def analyze_segment_folder(
             "overall_species_summary": "overall_species_summary.csv",
             "segments_dir": SEGMENT_PULSE_SUBDIR,
             "figures_dir": SEGMENT_FIGURE_SUBDIR,
+            "pulse_spectrograms_dir": "pulse_spectrograms",
+            **(
+                {"template_model": "template_model.json"}
+                if template_model_path is not None
+                else {}
+            ),
         },
     }
     (run_dir / "run_metadata.json").write_text(
@@ -1481,4 +1442,7 @@ def analyze_segment_folder(
         "model": model_info,
         "labels": labels,
         "uncertain_label": uncertain_label,
+        "template_model_path": (
+            str(template_model_path) if template_model_path is not None else ""
+        ),
     }

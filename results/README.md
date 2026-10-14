@@ -1,13 +1,8 @@
-# 结果目录
+# 输出目录
 
-程序输出按用途分类：
+运行后按模块新建输出：
 
-- `figures/`：适合展示的 PCA 图、频谱图和代表性脉冲图。
-- `tables/`：检测汇总、聚类中心、验证结果和逐脉冲特征表。
-- `predictions/`：新录音的预测结果。
-- `audio/`：切分后的脉冲、拒绝片段和分离结果。
+- `segment_analysis/<run_id>/`：模块①的逐声波 WAV、声谱图、片段概览、匹配明细和统计。
+- `noise_template_scan/<run_id>/`：模块②的低相似度 WAV、对应图片和人工候选记录。
 
-
-## Demo 输出
-
-运行 `python demo.py` 后，会在 `predictions/` 生成逐候选预测 CSV 和 `demo_summary.json`，并在 `figures/spectrograms/`、`figures/pulse_zooms/` 生成可视化。这些属于运行产物，默认由 `.gitignore` 排除。
+每次分析使用独立运行目录；输出可重新生成。当前历史输出已清理。

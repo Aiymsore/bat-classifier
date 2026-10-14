@@ -1,5 +1,1 @@
-"""Bat acoustic signal processing prototype."""
-
-from .pipeline import main
-
-__all__ = ["main"]
+"""蝙蝠声波模板匹配与低相似度初筛。"""

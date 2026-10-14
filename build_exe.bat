@@ -31,14 +31,6 @@ if exist "workspace_backup_tmp" (
 )
 
 echo.
-echo Self-test on built exe...
-"dist\BatClassifier\BatClassifier.exe" --selftest
-if errorlevel 1 (
-  echo [ERROR] Built exe self-test failed.
-  exit /b 1
-)
-
-echo.
 echo Build OK: dist\BatClassifier\BatClassifier.exe
 echo Note: run the exe in dist\BatClassifier\ (NOT the one inside build\ - that is an intermediate file).
 start "" explorer "dist\BatClassifier"

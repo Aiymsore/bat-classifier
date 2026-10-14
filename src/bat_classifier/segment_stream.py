@@ -1,4 +1,4 @@
-"""⑦ 超长 WAV 流式分析引擎（segment_analysis 的长录音后端）。
+"""① 超长 WAV 流式分析引擎（segment_analysis 的长录音后端）。
 
 设计原则（本轮优化的 A/B/C/D/E/Resume 都在这里落地）：
 
@@ -98,9 +98,6 @@ class ChunkSpec:
     read_start_s: float
     read_end_s: float
 
-    @property
-    def coverage_duration_s(self) -> float:
-        return self.coverage_end_s - self.coverage_start_s
 
 
 def build_chunk_specs(
@@ -518,6 +515,10 @@ class ChunkContext:
     total_samples: int
     separated_dir: Path | None = None
     save_separated_audio: bool = True
+    template_matching: bool = False
+    separation_window_mode: str = "fixed"
+    harmonic_grouping_mode: str = "basic"
+    retain_component_audio: bool = False
 
 
 @dataclass
@@ -529,12 +530,13 @@ class ChunkResult:
     skipped: bool = False
     error: str = ""
     read_y: np.ndarray | None = None   # 供导出 WAV 用，导出后释放
+    component_audio: dict[tuple[int, int], np.ndarray] = field(default_factory=dict)
 
 
 def process_chunk(spec: ChunkSpec, context: ChunkContext) -> ChunkResult:
     """处理一个 chunk：任何时刻只持有本块音频。"""
     from .detection import detect_pulses, refine_all_pulses
-    from .pulse_table import create_demo_pulse_rows
+    from .pulse_table import create_pulse_rows
 
     read_y = context.preprocessor.block(spec.read_start_s, spec.read_end_s)
     result = ChunkResult(spec=spec)
@@ -562,7 +564,7 @@ def process_chunk(spec: ChunkSpec, context: ChunkContext) -> ChunkResult:
     if not owned:
         return result
 
-    rows = create_demo_pulse_rows(
+    rows = create_pulse_rows(
         context.wav_path,
         read_y,
         sr,
@@ -570,13 +572,21 @@ def process_chunk(spec: ChunkSpec, context: ChunkContext) -> ChunkResult:
         separated_dir=context.separated_dir,
         max_pulses=None,          # 计数绝不被截断（导出上限另算）
         save_separated_audio=context.save_separated_audio,
+        include_template_track=context.template_matching,
+        separation_window_mode=context.separation_window_mode,
+        harmonic_grouping_mode=context.harmonic_grouping_mode,
+        component_audio_sink=result.component_audio if context.retain_component_audio else None,
     )
-    # 块内 local 时间 → global 绝对时间
+    # 块内 local 时间 → global 绝对时间；事件编号包含录音身份，跨录音/块不冲突。
+    recording_key = hashlib.sha256(str(context.wav_path.resolve()).encode("utf-8")).hexdigest()[:12]
     for row in rows:
+        row.pop("accepted", None)
+        row.pop("rejection_reason", None)
         for key in ("candidate_start_s", "candidate_end_s", "start_s", "end_s"):
             if key in row:
                 row[key] = float(row[key]) + spec.read_start_s
         row["_chunk_index"] = spec.index
+        row["event_id"] = f"{recording_key}_chunk{spec.index:06d}_candidate{int(row['candidate_id']):06d}"
 
     result.rows = rows
     result.read_y = read_y

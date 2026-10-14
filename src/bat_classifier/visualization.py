@@ -1,19 +1,14 @@
-"""结果可视化输出（被 pulse_table、clustering、prediction 调用）。
-
-职责：整段录音概览声谱图、最强脉冲放大网格图、聚类 PCA 散点图。
-导入本模块即完成 matplotlib 后端与中文字体设置。
-"""
+"""逐 pulse 波形/声谱图与整段录音概览。"""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import librosa
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-from scipy.signal import medfilt
 
 matplotlib.use("Agg")
 
@@ -26,335 +21,19 @@ plt.rcParams["font.sans-serif"] = [
 plt.rcParams["axes.unicode_minus"] = False
 
 from .audio_io import adaptive_stft_params, ultrasonic_band_mask
-from .config import (
-    ACOUSTIC_TYPE_LABELS,
-    CLUSTER_PCA_PNG,
-    CONTOUR_MIN_DB,
-    HIGH_FREQ_HZ,
-    LOW_FREQ_HZ,
-    OVERVIEW_MAX_TIME_BINS,
-    PULSE_ZOOM_DIR,
-    SPECTROGRAM_DIR,
-    TOP_PULSES_PER_FILE,
-    ZOOM_CONTEXT_MS,
-)
+from .config import HIGH_FREQ_HZ, LOW_FREQ_HZ, OVERVIEW_MAX_TIME_BINS
 
 
-def save_top_pulse_zoom_grid(
-    audio_path: Path,
-    y: np.ndarray,
-    sr: int,
-    pulse_rows: list[dict[str, float | int | str]],
-) -> None:
-    """
-    把当前WAV中能量最强的若干候选脉冲放大，并叠加主导频率轮廓线。
+# 结果图需要支持放大查看细节，统一提高 PNG 输出密度。
+OUTPUT_DPI = 300
 
-    每个小图：
-    - 横轴为相对时间（毫秒）
-    - 纵轴为频率（kHz）
-    - 白线为每个时间帧中能量最强的频率轨迹
-    """
-    if not pulse_rows:
-        return
-
-    strongest_rows = sorted(
-        pulse_rows,
-        key=lambda row: float(row.get("rms", 0.0)),
-        reverse=True,
-    )[:TOP_PULSES_PER_FILE]
-
-    columns = 2
-    rows_count = int(np.ceil(len(strongest_rows) / columns))
-
-    figure, axes = plt.subplots(
-        rows_count,
-        columns,
-        figsize=(14, max(4, rows_count * 3.4)),
-        squeeze=False,
-    )
-    axes_flat = axes.ravel()
-
-    context_samples = int(round(ZOOM_CONTEXT_MS / 1000 * sr))
-
-    for plot_index, row in enumerate(strongest_rows):
-        axis = axes_flat[plot_index]
-
-        start_sample = max(
-            0,
-            int(round(float(row["start_s"]) * sr)) - context_samples,
-        )
-        end_sample = min(
-            len(y),
-            int(round(float(row["end_s"]) * sr)) + context_samples,
-        )
-        segment = y[start_sample:end_sample]
-
-        if len(segment) < 64:
-            axis.set_visible(False)
-            continue
-
-        # 放大图优先保证时间分辨率
-        n_fft, hop_length = adaptive_stft_params(
-            len(segment),
-            max_n_fft=512,
-            min_n_fft=128,
-            min_hop=8,
-        )
-
-        stft = librosa.stft(
-            segment,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            window="hann",
-            center=True,
-        )
-        pulse_power = np.abs(stft) ** 2
-        pulse_db = librosa.power_to_db(
-            pulse_power + 1e-18,
-            ref=np.max,
-        )
-
-        pulse_frequencies = librosa.fft_frequencies(
-            sr=sr,
-            n_fft=n_fft,
-        )
-        pulse_times_ms = (
-            librosa.frames_to_time(
-                np.arange(pulse_power.shape[1]),
-                sr=sr,
-                hop_length=hop_length,
-            )
-            * 1000
-        )
-
-        frequency_mask = ultrasonic_band_mask(
-            pulse_frequencies,
-            sr,
-        )
-
-        selected_frequencies = pulse_frequencies[frequency_mask]
-        selected_power = pulse_power[frequency_mask, :]
-        selected_db = pulse_db[frequency_mask, :]
-
-        axis.pcolormesh(
-            pulse_times_ms,
-            selected_frequencies / 1000,
-            selected_db,
-            shading="auto",
-            vmin=-60,
-            vmax=0,
-        )
-
-        # 每个时间帧找能量最高的频率，形成轮廓线
-        dominant_indices = np.argmax(selected_power, axis=0)
-        contour_khz = (
-            selected_frequencies[dominant_indices] / 1000
-        )
-
-        if len(contour_khz) >= 5:
-            contour_khz = medfilt(contour_khz, kernel_size=5)
-
-        frame_peak_db = np.max(selected_db, axis=0)
-        reliable_mask = frame_peak_db >= CONTOUR_MIN_DB
-
-        axis.plot(
-            pulse_times_ms[reliable_mask],
-            contour_khz[reliable_mask],
-            color="white",
-            linewidth=1.4,
-        )
-
-        pulse_id = int(row["pulse_id"])
-        duration_ms = float(row["duration_ms"])
-        peak_freq_khz = float(row["peak_freq_khz"])
-        start_freq_khz = float(row["start_freq_khz"])
-        end_freq_khz = float(row["end_freq_khz"])
-
-        axis.set_title(
-            f"Pulse {pulse_id} | "
-            f"duration={duration_ms:.2f} ms | "
-            f"peak={peak_freq_khz:.1f} kHz\n"
-            f"start={start_freq_khz:.1f}, "
-            f"end={end_freq_khz:.1f} kHz"
-        )
-        axis.set_ylim(
-            LOW_FREQ_HZ / 1000,
-            min(HIGH_FREQ_HZ, sr / 2) / 1000,
-        )
-        axis.set_xlabel("Relative time (ms)")
-        axis.set_ylabel("Frequency (kHz)")
-
-    for unused_axis in axes_flat[len(strongest_rows):]:
-        unused_axis.set_visible(False)
-
-    figure.suptitle(
-        f"{audio_path.name} | "
-        f"top {len(strongest_rows)} strongest candidate pulses",
-        fontsize=14,
-    )
-    figure.tight_layout(rect=(0, 0, 1, 0.97))
-
-    output_path = (
-        PULSE_ZOOM_DIR
-        / f"{audio_path.stem}_top_pulses.png"
-    )
-    figure.savefig(
-        output_path,
-        dpi=180,
-    )
-    plt.close(figure)
-
-
-def save_fast_overview_spectrogram(
-    audio_path: Path,
-    y: np.ndarray,
-    sr: int,
-    pulse_count: int,
-) -> None:
-    """
-    保存压缩版整段声谱图。
-    时间帧最多约4000个，因此几十秒录音也不会占用巨大内存。
-    """
-    n_fft = 1024
-    dynamic_hop = int(
-        np.ceil(
-            len(y) / OVERVIEW_MAX_TIME_BINS
-        )
-    )
-    hop_length = max(
-        512,
-        dynamic_hop,
-    )
-
-    stft = librosa.stft(
-        y,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        window="hann",
-        center=True,
-    )
-    power = np.abs(stft) ** 2
-    frequencies = librosa.fft_frequencies(
-        sr=sr,
-        n_fft=n_fft,
-    )
-    times = librosa.frames_to_time(
-        np.arange(power.shape[1]),
-        sr=sr,
-        hop_length=hop_length,
-    )
-
-    mask = ultrasonic_band_mask(frequencies, sr)
-    selected_power = power[mask, :]
-    selected_frequencies = frequencies[mask]
-
-    if selected_power.size == 0:
-        return
-
-    power_db = librosa.power_to_db(
-        selected_power + 1e-18,
-        ref=np.max,
-    )
-
-    figure, axis = plt.subplots(
-        figsize=(14, 5)
-    )
-    mesh = axis.pcolormesh(
-        times,
-        selected_frequencies / 1000,
-        power_db,
-        shading="auto",
-        vmin=-80,
-        vmax=0,
-    )
-    axis.set_title(
-        f"{audio_path.name} | "
-        f"accepted pulses: {pulse_count}"
-    )
-    axis.set_xlabel("Time (s)")
-    axis.set_ylabel("Frequency (kHz)")
-    figure.colorbar(
-        mesh,
-        ax=axis,
-        label="Relative power (dB)",
-    )
-    figure.tight_layout()
-    output_path = (
-        SPECTROGRAM_DIR
-        / f"{audio_path.stem}_overview.png"
-    )
-    figure.savefig(
-        output_path,
-        dpi=150,
-    )
-    plt.close(figure)
-
-
-def save_pca_plot(
-    data: pd.DataFrame,
-    labels: list[str] | None = None,
-    output_path: Path | None = None,
-    label_prefix: str = "声型",
-    title: str | None = None,
-    label_column: str = "acoustic_type",
-) -> None:
-    """保存每个点代表一个脉冲的二维PCA聚类图。
-
-    output_path/label_prefix/title/label_column 默认保持历史行为
-    （A-D 声型图）；批量整理（curation）传入自己的 run 目录、
-    "Cluster " 前缀与 cluster_id 列，复用同一套绘图逻辑而不复制代码。
-    """
-    if labels is None:
-        labels = list(ACOUSTIC_TYPE_LABELS)
-    if output_path is None:
-        output_path = CLUSTER_PCA_PNG
-    figure, axis = plt.subplots(
-        figsize=(10, 7)
-    )
-
-    for acoustic_type in labels:
-        group = data[
-            data[label_column]
-            == acoustic_type
-        ]
-        if group.empty:
-            continue
-
-        axis.scatter(
-            group["pca_1"],
-            group["pca_2"],
-            s=20,
-            alpha=0.65,
-            label=(
-                f"{label_prefix}{acoustic_type} "
-                f"({len(group)})"
-            ),
-        )
-
-    if title is None:
-        if labels == ["A", "B", "C", "D"]:
-            title = (
-                "Bat acoustic pulse clusters A-D (PCA)"
-            )
-        else:
-            title = (
-                "Bat acoustic pulse clusters (PCA)"
-            )
-    axis.set_title(title)
-    axis.set_xlabel("PCA component 1")
-    axis.set_ylabel("PCA component 2")
-    axis.legend()
-    figure.tight_layout()
-    output_path = Path(output_path)
-    output_path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-    figure.savefig(
-        output_path,
-        dpi=180,
-    )
-    plt.close(figure)
+# [可选显示实验区，可整体删除/回退]
+# 这些参数只影响结果图的显示，不参与检测、特征或分类。
+AUTO_FOCUS_THRESHOLD_DB = 24.0
+AUTO_FOCUS_PADDING_HZ = 8_000.0
+AUTO_FOCUS_MIN_SPAN_HZ = 20_000.0
+AUTO_GAIN_RANGE_DB = 45.0
+WAVEFORM_TRACE_MAX_POINTS = 24_000
 
 
 def save_representative_spectrogram(
@@ -362,16 +41,22 @@ def save_representative_spectrogram(
     sr: int,
     output_path: Path,
     title_lines: list[str],
+    auto_focus: bool = False,
+    show_waveform: bool = False,
+    frequency_limits_hz: tuple[float, float] | None = None,
+    component_annotations: list[tuple[float, str]] | None = None,
 ) -> bool:
     """为代表样本保存统一尺度的单脉冲声谱图（专家审核用）。
 
     统一原则（避免不同图片尺度造成视觉误导）：
-    - 频率范围固定为超声分析频段 [LOW_FREQ_HZ, min(HIGH_FREQ_HZ, sr/2)]；
+    - 默认频率范围固定为超声分析频段；逐 pulse 浏览器可传入 auto_focus 聚焦主频；
     - 颜色尺度固定 -60..0 dB；
     - 图尺寸与 DPI 固定；时间轴为脉冲自身区间并留 5% 边距。
 
     title_lines 直接显示在标题中（Cluster、Pulse ID、duration、
     peak/start/end frequency、SNR 等），不写“预测物种”。
+    ``show_waveform`` 用于第七模块的逐声波图：在彩色频谱上方增加
+    放大的真实 WAV 波形，便于按线性形状先做人工判断。
     """
     if len(pulse_y) < 32:
         return False
@@ -414,9 +99,55 @@ def save_representative_spectrogram(
         * 1000
     )
 
-    figure, axis = plt.subplots(
-        figsize=(9, 4.5)
-    )
+    if show_waveform:
+        # 第七模块的逐声波图采用 Avisoft 类似的上下布局：顶部 pulse
+        # 时域波形占更大高度，下面保留现有彩色频谱与自动聚焦频率轴。
+        figure = plt.figure(figsize=(10, 7))
+        grid = figure.add_gridspec(
+            2,
+            1,
+            height_ratios=(2.3, 4.7),
+            hspace=0.08,
+        )
+        wave_axis = figure.add_subplot(grid[0])
+        axis = figure.add_subplot(grid[1], sharex=wave_axis)
+
+        trace = _waveform_trace(pulse_y, sr)
+        if trace is not None:
+            trace_seconds, trace_values = trace
+            trace_ms = trace_seconds * 1000.0
+            wave_axis.fill_between(
+                trace_ms,
+                0.0,
+                trace_values,
+                color="#ffad00",
+                linewidth=0,
+                alpha=0.98,
+            )
+            wave_axis.plot(
+                trace_ms,
+                trace_values,
+                color="#ffc14d",
+                linewidth=0.35,
+                antialiased=True,
+            )
+        wave_axis.axhline(0.0, color="#777777", linewidth=0.5)
+        wave_axis.set_facecolor("black")
+        wave_axis.set_ylim(-1.08, 1.08)
+        wave_axis.set_yticks([])
+        wave_axis.tick_params(
+            axis="x", which="both", labelbottom=False, length=0
+        )
+        for spine in wave_axis.spines.values():
+            spine.set_color("#404040")
+        figure.suptitle(
+            "\n".join(title_lines),
+            fontsize=10,
+            y=0.995,
+            linespacing=1.15,
+        )
+    else:
+        figure, axis = plt.subplots(figsize=(9, 4.5))
     axis.pcolormesh(
         times_ms,
         selected_frequencies / 1000,
@@ -426,29 +157,80 @@ def save_representative_spectrogram(
         vmax=0,
         cmap="magma",
     )
-    axis.set_ylim(
-        LOW_FREQ_HZ / 1000,
-        min(HIGH_FREQ_HZ, sr / 2) / 1000,
-    )
+    if frequency_limits_hz is not None:
+        focus_low, focus_high = frequency_limits_hz
+    elif auto_focus:
+        focus_low, focus_high, _ = _auto_frequency_limits(
+            selected_db,
+            selected_frequencies,
+            sr,
+        )
+    else:
+        focus_low = float(LOW_FREQ_HZ)
+        focus_high = float(min(HIGH_FREQ_HZ, sr / 2))
+    axis.set_ylim(focus_low / 1000, focus_high / 1000)
+    for frequency_khz, label in component_annotations or []:
+        axis.axhline(frequency_khz, color="cyan", linewidth=0.5, alpha=0.6)
+        axis.text(0.99, frequency_khz, label, transform=axis.get_yaxis_transform(),
+                  ha="right", va="bottom", color="cyan", fontsize=8)
     if len(times_ms):
         span = max(float(times_ms[-1]), 1e-6)
-        axis.set_xlim(-0.05 * span, 1.05 * span)
+        if show_waveform:
+            # 与顶部真实波形共用 pulse 自身时间范围，不把 STFT 的边缘
+            # padding 误显示成额外叫声。
+            pulse_duration_ms = max(
+                float(len(pulse_y)) / max(float(sr), 1.0) * 1000.0,
+                span,
+            )
+            axis.set_xlim(0.0, pulse_duration_ms)
+        else:
+            axis.set_xlim(-0.05 * span, 1.05 * span)
     axis.set_xlabel("Time (ms)")
     axis.set_ylabel("Frequency (kHz)")
-    axis.set_title("\n".join(title_lines), fontsize=10)
+    if not show_waveform:
+        axis.set_title("\n".join(title_lines), fontsize=10)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
-    figure.tight_layout()
+    if show_waveform:
+        figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
+    else:
+        figure.tight_layout()
     figure.savefig(
         output_path,
-        dpi=150,
+        dpi=OUTPUT_DPI,
     )
     plt.close(figure)
     return True
+
+
+def save_pulse_spectrogram(
+    pulse_y: np.ndarray,
+    sr: int,
+    output_path: Path,
+    title_lines: list[str],
+    *,
+    frequency_limits_hz: tuple[float, float] | None = None,
+    component_annotations: list[tuple[float, str]] | None = None,
+) -> bool:
+    """保存一个已检测/分类 pulse 的独立声谱图。
+
+    逐 pulse 图片与代表样本使用同一套 STFT、频率范围和颜色尺度，
+    但输出路径由第七模块按最终类别分目录管理，便于逐类浏览。
+    """
+    return save_representative_spectrogram(
+        pulse_y,
+        sr,
+        output_path,
+        title_lines,
+        auto_focus=True,
+        show_waveform=True,
+        frequency_limits_hz=frequency_limits_hz,
+        component_annotations=component_annotations,
+    )
 
 
 def save_segment_call_overview(
@@ -458,11 +240,11 @@ def save_segment_call_overview(
     pulse_rows: list[dict],
     output_path: Path,
     title: str | None = None,
+    auto_focus: bool = True,
 ) -> bool:
-    """保存整段片段声谱图，并在每个检测叫声区上标注编号与预测标签。
+    """保存整段片段线性声谱图（Avisoft 风格，不叠加叫声标注）。
 
-    用于 ⑦ 片段识别与叫声统计：一张图看清
-    “这一段 WAV 里有几次叫声、每次是什么标签”。
+    用于 ① 片段识别与叫声统计：一段 WAV 的整体时频外观。
     只扩展现有 matplotlib 绘图逻辑，不另起一套。
     """
     if len(y) < 64:
@@ -503,6 +285,8 @@ def save_segment_call_overview(
         output_path,
         title=title,
         audio_name=audio_path.name,
+        waveform=y,
+        auto_focus=auto_focus,
     )
 
 
@@ -511,8 +295,10 @@ def save_segment_call_overview_from_summary(
     pulse_rows: list[dict],
     output_path: Path,
     title: str | None = None,
+    auto_focus: bool = True,
+    waveform: np.ndarray | None = None,
 ) -> bool:
-    """⑦ 长录音版 overview：用流式累计的低分辨率摘要绘图。
+    """① 长录音版 overview：用流式累计的低分辨率摘要绘图。
 
     与 save_segment_call_overview 同一绘图逻辑，区别只是声谱来自
     segment_stream.SpectrogramSummary 的逐块累计——
@@ -540,7 +326,260 @@ def save_segment_call_overview_from_summary(
         output_path,
         title=title,
         audio_name="",
+        waveform=waveform,
+        auto_focus=auto_focus,
     )
+
+
+def save_quick_overview(
+    audio_path: Path,
+    output_path: Path,
+    title: str | None = None,
+) -> bool:
+    """① 直接查看入口（WAV）：不跑检测/分类，只出线性声谱图 + 波形条。
+
+    与 save_segment_call_overview 同一绘图逻辑（含 sidecar 光标几何），
+    区别只是 pulse_rows 为空、不依赖任何分析结果。长录音走流式低分辨率
+    摘要路径，绝不为出图整条 STFT。
+    """
+    from .audio_io import load_audio
+    from .segment_stream import SpectrogramSummary
+
+    audio_path = Path(audio_path)
+    y, sr = load_audio(audio_path)
+    duration_s = len(y) / float(sr)
+
+    if duration_s <= 30.0:
+        return save_segment_call_overview(
+            audio_path,
+            y,
+            sr,
+            [],
+            output_path,
+            title=title or f"{audio_path.name} | 直接查看",
+        )
+
+    summary = SpectrogramSummary(duration_s, sr=sr)
+    block = max(int(sr * 1.0), 4096)
+    for start in range(0, len(y), block):
+        summary.add(y[start : start + block], start / float(sr))
+    return save_segment_call_overview_from_summary(
+        summary,
+        [],
+        output_path,
+        title=title or f"{audio_path.name} | 直接查看",
+        auto_focus=True,
+        waveform=y,
+    )
+
+
+def save_son_overview(
+    son_path: Path,
+    output_path: Path,
+    title: str | None = None,
+) -> bool:
+    """① 直接查看入口（SON）：用 .son 缓存的逐帧 FFT 幅度谱出线谱图。
+
+    底部不重算 STFT，数据源是 SASLab 预先算好的频谱缓存，坐标轴来自
+    .son 头部（采样率/帧移/频率分辨率）；同名 WAV 只作为顶部真实波形的可选数据源。
+    """
+    from .son_reader import read_son
+
+    son_path = Path(son_path)
+    snapshot = read_son(son_path)
+    power_db = snapshot.power_db()  # (bins, frames)
+    frequencies = snapshot.frequencies()
+    times = snapshot.times()
+
+    mask = ultrasonic_band_mask(frequencies, snapshot.sample_rate)
+    selected_power = power_db[mask, :]
+    selected_frequencies = frequencies[mask]
+    if selected_power.size == 0:
+        return False
+
+    # [可选真实波形显示，可删除]
+    # SON 只保存频谱帧；若同目录存在同名 WAV，则用 WAV 的时域采样值
+    # 绘制顶部波形，底部仍使用 SON 的原始频谱缓存。没有 WAV 时回退到
+    # 频谱能量包络，保证单独分发 SON 文件时仍然可以查看。
+    waveform = _load_companion_waveform(son_path, snapshot.sample_rate)
+
+    return _plot_segment_call_overview(
+        selected_power,
+        times,
+        selected_frequencies,
+        snapshot.sample_rate,
+        [],
+        output_path,
+        title=title or f"{son_path.name} | 直接查看",
+        audio_name=son_path.name,
+        waveform=waveform,
+        auto_focus=True,
+    )
+
+
+def save_direct_overview(
+    source_path: Path,
+    output_path: Path,
+    title: str | None = None,
+) -> bool:
+    """① 直接查看统一入口：按扩展名分派 WAV / SON。"""
+    source_path = Path(source_path)
+    suffix = source_path.suffix.lower()
+    if suffix == ".son":
+        return save_son_overview(source_path, output_path, title=title)
+    if suffix != ".wav":
+        raise ValueError(f"不支持的文件类型：{source_path.suffix}（仅支持 .wav / .son）")
+    return save_quick_overview(source_path, output_path, title=title)
+
+
+def _band_envelope(power_db: np.ndarray) -> np.ndarray:
+    """由声谱 dB 反推带内能量包络，归一化到 0..1。
+
+    顶部波形条用（≈ Avisoft 的示波条）：流式摘要路径拿不到原始波形，
+    用每个时间帧的带内总能量做包络，脉冲处自然形成尖峰。
+    动态范围过小（近乎静音）时返回全 0，避免画出一条满幅假信号。
+    """
+    linear = np.power(10.0, np.asarray(power_db, dtype=np.float64) / 10.0)
+    band_power = linear.sum(axis=0)
+    if band_power.size == 0:
+        return np.zeros(0)
+    peak = float(band_power.max())
+    if peak <= 0.0:
+        return np.zeros(band_power.shape[0])
+    if float(np.ptp(band_power)) / peak < 0.5:
+        return np.zeros(band_power.shape[0])
+    return np.sqrt(band_power / peak)
+
+
+def _load_companion_waveform(
+    source_path: Path,
+    target_sr: int,
+) -> np.ndarray | None:
+    """读取与 SON 同名的 WAV，作为顶部真实时域波形的可选数据源。"""
+    source_path = Path(source_path)
+    candidates = [
+        source_path.with_suffix(".wav"),
+        source_path.with_suffix(".WAV"),
+    ]
+    wav_path = next((path for path in candidates if path.exists()), None)
+    if wav_path is None:
+        return None
+
+    try:
+        waveform, sample_rate = librosa.load(
+            wav_path,
+            sr=None,
+            mono=True,
+        )
+        waveform = np.asarray(waveform, dtype=np.float64)
+        waveform = waveform[np.isfinite(waveform)]
+        if waveform.size < 2:
+            return None
+        if int(sample_rate) != int(target_sr):
+            waveform = librosa.resample(
+                waveform,
+                orig_sr=int(sample_rate),
+                target_sr=int(target_sr),
+            )
+        peak = float(np.max(np.abs(waveform)))
+        if peak <= 0.0:
+            return None
+        return (waveform / peak).astype(np.float32, copy=False)
+    except Exception:  # noqa: BLE001 - 真实波形失败时回退频谱包络
+        return None
+
+
+def _waveform_trace(
+    waveform: np.ndarray,
+    sr: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """把 WAV 采样值压缩为可绘制的真实波形轨迹。"""
+    values = np.asarray(waveform, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return None
+    peak = float(np.max(np.abs(values)))
+    if peak <= 0.0:
+        return None
+    values = values / peak
+
+    if values.size <= WAVEFORM_TRACE_MAX_POINTS:
+        times = np.arange(values.size, dtype=np.float64) / float(sr)
+        return times, values
+
+    # 长 WAV 不逐点写入 PNG；每个小块保留 min/max，避免尖峰被抽样丢掉。
+    bucket = int(np.ceil(values.size / WAVEFORM_TRACE_MAX_POINTS))
+    trace_times: list[float] = []
+    trace_values: list[float] = []
+    for start in range(0, values.size, bucket):
+        end = min(values.size, start + bucket)
+        chunk = values[start:end]
+        if chunk.size == 0:
+            continue
+        low_index = int(np.argmin(chunk))
+        high_index = int(np.argmax(chunk))
+        ordered = sorted(
+            ((low_index, float(chunk[low_index])),
+             (high_index, float(chunk[high_index])))
+        )
+        for offset, value in ordered:
+            trace_times.append((start + offset) / float(sr))
+            trace_values.append(value)
+    if not trace_values:
+        return None
+    return (
+        np.asarray(trace_times, dtype=np.float64),
+        np.asarray(trace_values, dtype=np.float64),
+    )
+
+
+def _auto_frequency_limits(
+    power_db: np.ndarray,
+    selected_frequencies: np.ndarray,
+    sr: int,
+) -> tuple[float, float, str]:
+    """根据可见频谱能量自动选择频率范围，失败时返回完整超声频段。"""
+    full_low = float(LOW_FREQ_HZ)
+    full_high = float(min(HIGH_FREQ_HZ, sr / 2.0))
+    frequencies = np.asarray(selected_frequencies, dtype=np.float64)
+    matrix = np.asarray(power_db, dtype=np.float64)
+    if frequencies.size < 4 or matrix.ndim != 2:
+        return full_low, full_high, "full-fallback"
+
+    safe_matrix = np.where(np.isfinite(matrix), matrix, -np.inf)
+    profile = np.max(safe_matrix, axis=1)
+    valid = np.isfinite(profile) & np.isfinite(frequencies)
+    if int(valid.sum()) < 4:
+        return full_low, full_high, "full-fallback"
+
+    valid_profile = profile[valid]
+    peak = float(np.max(valid_profile))
+    active = valid & (profile >= peak - AUTO_FOCUS_THRESHOLD_DB)
+    active_indices = np.flatnonzero(active)
+    if active_indices.size < 3:
+        return full_low, full_high, "full-fallback"
+
+    # 把不连续的频率活动分成几段，优先选择峰值最高的主叫声频带。
+    gaps = np.flatnonzero(np.diff(active_indices) > 2) + 1
+    groups = np.split(active_indices, gaps)
+    group = max(
+        groups,
+        key=lambda indices: (
+            float(np.max(profile[indices])),
+            float(np.sum(np.maximum(profile[indices] - peak + AUTO_FOCUS_THRESHOLD_DB, 0.0))),
+        ),
+    )
+    low = float(frequencies[group[0]]) - AUTO_FOCUS_PADDING_HZ
+    high = float(frequencies[group[-1]]) + AUTO_FOCUS_PADDING_HZ
+    center = (low + high) / 2.0
+    span = max(high - low, AUTO_FOCUS_MIN_SPAN_HZ)
+    low = center - span / 2.0
+    high = center + span / 2.0
+    low = max(full_low, low)
+    high = min(full_high, high)
+    if high <= low or (high - low) >= 0.85 * (full_high - full_low):
+        return full_low, full_high, "full-fallback"
+    return low, high, "auto"
 
 
 def _plot_segment_call_overview(
@@ -552,73 +591,160 @@ def _plot_segment_call_overview(
     output_path: Path,
     title: str | None = None,
     audio_name: str = "",
+    waveform: np.ndarray | None = None,
+    auto_focus: bool = True,
 ) -> bool:
-    """片段声谱图 + 叫声标注的公共绘图（旧/流式两路共用）。"""
-    figure, axis = plt.subplots(figsize=(14, 5))
-    mesh = axis.pcolormesh(
+    """片段线性声谱图 + 波形条的公共绘图（旧/流式两路共用）。
+
+    ① 片段详情的最终输出图，按 Avisoft SASLab 的线性图风格绘制：
+    - 顶部窄条：优先使用同源 WAV 的真实时域波形，没有 WAV 时使用能量包络；
+    - 主图：线性频率轴（Hz）× 线性时间轴（s），白底灰度，
+      能量越强越黑，无色标；
+    - 不叠加叫声区间/标签标注（纯观察视图，pulse_rows 只用于
+      统计标题里的 call 数）。
+    """
+    # 固定版面（不能用 bbox_inches="tight"：① 查看器靠这里记录的
+    # 坐标区分数位置把 PNG 像素换算回频率，裁剪会让几何失效）
+    figure = plt.figure(figsize=(14, 6))
+    figure.subplots_adjust(
+        left=0.08, right=0.985, top=0.93, bottom=0.11
+    )
+    grid = figure.add_gridspec(
+        2, 1, height_ratios=(1, 4), hspace=0.06
+    )
+    wave_axis = figure.add_subplot(grid[0])
+    axis = figure.add_subplot(grid[1], sharex=wave_axis)
+
+    # ---- 顶部：真实 WAV 波形；无 WAV 时回退为频谱能量包络 ----
+    waveform_mode = "spectral-envelope"
+    trace = _waveform_trace(waveform, sr) if waveform is not None else None
+    if trace is not None:
+        waveform_mode = "wav-waveform"
+        trace_times, trace_values = trace
+        wave_axis.plot(
+            trace_times,
+            trace_values,
+            color="#ff9500",
+            linewidth=0.45,
+            antialiased=True,
+        )
+    else:
+        envelope = _band_envelope(power_db)
+        if envelope.size and times.size:
+            count = min(envelope.size, times.size)
+            wave_axis.fill_between(
+                times[:count],
+                -envelope[:count],
+                envelope[:count],
+                color="#ff9500",
+                linewidth=0,
+            )
+    if (trace is not None) or (envelope.size and times.size):
+        wave_axis.axhline(0, color="#808080", linewidth=0.5)
+    wave_axis.set_facecolor("black")
+    wave_axis.set_ylim(-1.08, 1.08)
+    wave_axis.set_yticks([])
+    wave_axis.tick_params(
+        axis="x", which="both", labelbottom=False, length=0
+    )
+    for spine in wave_axis.spines.values():
+        spine.set_color("#404040")
+
+    # ---- 主图：白底灰度线性声谱图（灰度图：值越大越黑）----
+    if auto_focus:
+        focus_low, focus_high, focus_mode = _auto_frequency_limits(
+            power_db,
+            selected_frequencies,
+            sr,
+        )
+    else:
+        focus_low = float(LOW_FREQ_HZ)
+        focus_high = float(min(HIGH_FREQ_HZ, sr / 2.0))
+        focus_mode = "full"
+
+    with np.errstate(all="ignore"):
+        finite_db = np.asarray(power_db, dtype=np.float64)
+        finite_db = finite_db[np.isfinite(finite_db)]
+    if finite_db.size:
+        display_vmax = float(np.max(finite_db))
+        display_vmin = max(
+            -80.0,
+            display_vmax - AUTO_GAIN_RANGE_DB,
+        )
+    else:
+        display_vmax = 0.0
+        display_vmin = -80.0
+
+    axis.pcolormesh(
         times,
-        selected_frequencies / 1000,
+        selected_frequencies,
         power_db,
         shading="auto",
-        vmin=-80,
-        vmax=0,
+        vmin=display_vmin,
+        vmax=display_vmax,
+        cmap="gray_r",
     )
-    axis.set_ylim(
-        LOW_FREQ_HZ / 1000,
-        min(HIGH_FREQ_HZ, sr / 2) / 1000,
-    )
+    axis.set_ylim(focus_low, focus_high)
     axis.set_xlabel("Time (s)")
-    axis.set_ylabel("Frequency (kHz)")
+    axis.set_ylabel("Frequency (Hz)")
+    axis.text(
+        0.995,
+        0.01,
+        f"灰度：越黑能量越强（{display_vmin:.0f}…{display_vmax:.0f} dB） | {focus_mode}",
+        transform=axis.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        color="#666666",
+    )
 
-    # 标注每个检测到的叫声区
-    call_index = 0
-    for row in pulse_rows:
-        if str(row.get("predicted_label", "")) == "noise":
-            continue
-        call_index += 1
-        start_s = float(row.get("start_s", 0.0))
-        end_s = float(row.get("end_s", start_s))
-        label = str(row.get("predicted_label", ""))
-        confidence = row.get("confidence")
-        pulse_id = str(row.get("pulse_id", call_index))
-
-        axis.axvspan(start_s, end_s, color="red", alpha=0.18)
-        axis.axvline(start_s, color="red", linewidth=0.8, alpha=0.7)
-        axis.axvline(end_s, color="red", linewidth=0.8, alpha=0.7)
-
-        tag = f"[{label}]" if label else f"[{pulse_id}]"
-        if confidence is not None:
-            try:
-                tag += f" {float(confidence):.2f}"
-            except (TypeError, ValueError):
-                pass
-        axis.text(
-            (start_s + end_s) / 2,
-            0.97,
-            tag,
-            transform=axis.get_xaxis_transform(),
-            ha="center",
-            va="top",
-            fontsize=9,
-            color="red",
-            bbox=dict(
-                boxstyle="round,pad=0.2",
-                facecolor="white",
-                alpha=0.7,
-                edgecolor="red",
-            ),
-        )
+    # 不叠加红色叫声标注（纯观察视图）：pulse_rows 只用于标题里的 call 数
+    call_index = sum(
+        1
+        for row in pulse_rows
+        if str(row.get("predicted_label", "")) != "noise"
+    )
 
     if title is None:
         title = (
             f"{audio_name} | calls: {call_index}"
         )
-    axis.set_title(title)
+    wave_axis.set_title(title, fontsize=11, pad=6)
 
-    figure.colorbar(mesh, ax=axis, label="Relative power (dB)")
-    figure.tight_layout()
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output_path, dpi=150)
+
+    # ---- sidecar：坐标区几何 + 频率范围，供 ① 查看器叠加频率光标 ----
+    # 查看窗口读 PNG 时按这份数值把像素 y 换算回 Hz（等价 Avisoft 的游标）。
+    position = axis.get_position()
+    peak_hz: float | None = None
+    if power_db.size and selected_frequencies.size:
+        peak_index = int(np.argmax(power_db.max(axis=1)))
+        peak_hz = float(selected_frequencies[peak_index])
+    meta = {
+        "axes_bbox": [
+            float(position.x0),
+            float(position.y0),
+            float(position.width),
+            float(position.height),
+        ],
+        "freq_ylim": [float(v) for v in axis.get_ylim()],
+        "time_xlim": [float(v) for v in axis.get_xlim()],
+        "figure_size": [float(v) for v in figure.get_size_inches()],
+        "dpi": OUTPUT_DPI,
+        "cursor_init_hz": peak_hz,
+        "waveform_mode": waveform_mode,
+        "frequency_focus_mode": focus_mode,
+        "display_db_range": [display_vmin, display_vmax],
+    }
+    try:
+        output_path.with_suffix(".json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:  # 绘图本身不受 sidecar 失败影响
+        pass
+
+    figure.savefig(output_path, dpi=OUTPUT_DPI)
     plt.close(figure)
     return True

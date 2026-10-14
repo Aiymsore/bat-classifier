@@ -3,7 +3,7 @@
 三节内容：
 1. 粗检：按超声频段能量阈值找出候选脉冲（detect_pulses）；
 2. 精修：在候选区内重找高信噪比脉冲核心（refine_pulse_boundary 等）；
-3. 分块检测：长录音抽窗分析并去重（detect_and_refine_pulses_chunked）。
+长录音的连续分块与跨块去重由 segment_stream.py 负责。
 """
 
 from __future__ import annotations
@@ -24,10 +24,7 @@ from .config import (
     CORE_MAX_THRESHOLD_DB,
     CORE_PADDING_MS,
     CORE_THRESHOLD_DB,
-    DETECTION_CHUNK_OVERLAP_MS,
-    DETECTION_CHUNK_SECONDS,
     ENERGY_THRESHOLD_DB,
-    MAX_ANALYSIS_WINDOWS_PER_RECORDING,
     MAX_PULSE_MS,
     MERGE_GAP_MS,
     MIN_PULSE_MS,
@@ -66,6 +63,8 @@ def merge_active_frames(
 def detect_pulses(
     y: np.ndarray,
     sr: int,
+    *,
+    max_duration_ms: float = MAX_PULSE_MS,
 ) -> tuple[list[dict[str, float]], np.ndarray, np.ndarray, np.ndarray, float]:
     """
     从声谱图能量中检测疑似脉冲。
@@ -128,7 +127,7 @@ def detect_pulses(
         )
         duration_ms = (end_s - start_s) * 1000
 
-        if not (MIN_PULSE_MS <= duration_ms <= MAX_PULSE_MS):
+        if not (MIN_PULSE_MS <= duration_ms <= max_duration_ms):
             continue
 
         pulses.append(
@@ -167,6 +166,8 @@ def refine_pulse_boundary(
     y: np.ndarray,
     sr: int,
     pulse: dict[str, float],
+    *,
+    max_duration_ms: float = MAX_PULSE_MS,
 ) -> dict[str, float] | None:
     """
     在候选区内部重新寻找高信噪比的脉冲核心。
@@ -266,7 +267,7 @@ def refine_pulse_boundary(
         core_end_sample - core_start_sample
     ) / sr * 1000
 
-    if not (MIN_PULSE_MS <= duration_ms <= MAX_PULSE_MS):
+    if not (MIN_PULSE_MS <= duration_ms <= max_duration_ms):
         return None
 
     core_frame_values = energy_db[start_frame : end_frame + 1]
@@ -300,12 +301,14 @@ def refine_all_pulses(
     y: np.ndarray,
     sr: int,
     pulses: list[dict[str, float]],
+    *,
+    max_duration_ms: float = MAX_PULSE_MS,
 ) -> list[dict[str, float]]:
     """对所有候选脉冲进行边界精修，并删除重叠的重复候选。"""
     refined: list[dict[str, float]] = []
 
     for pulse in pulses:
-        result = refine_pulse_boundary(y, sr, pulse)
+        result = refine_pulse_boundary(y, sr, pulse, max_duration_ms=max_duration_ms)
         if result is not None:
             refined.append(result)
 
@@ -333,209 +336,3 @@ def refine_all_pulses(
         deduplicated.append(pulse)
 
     return deduplicated
-
-
-def remove_duplicate_boundary_pulses(
-    pulses: list[dict[str, float]],
-) -> list[dict[str, float]]:
-    """删除分块重叠区域中重复检测到的同一脉冲。"""
-    if not pulses:
-        return []
-
-    pulses = sorted(
-        pulses,
-        key=lambda pulse: (
-            float(pulse["start_s"]),
-            float(pulse["end_s"]),
-        ),
-    )
-    kept: list[dict[str, float]] = []
-
-    for pulse in pulses:
-        if not kept:
-            kept.append(pulse)
-            continue
-
-        previous = kept[-1]
-        overlap_ratio = interval_overlap_ratio(
-            float(previous["start_s"]),
-            float(previous["end_s"]),
-            float(pulse["start_s"]),
-            float(pulse["end_s"]),
-        )
-        center_distance_ms = abs(
-            (
-                float(previous["start_s"])
-                + float(previous["end_s"])
-            )
-            / 2
-            - (
-                float(pulse["start_s"])
-                + float(pulse["end_s"])
-            )
-            / 2
-        ) * 1000
-
-        if (
-            overlap_ratio >= 0.50
-            or center_distance_ms <= 1.5
-        ):
-            previous_snr = float(
-                previous.get("snr_db", -999.0)
-            )
-            current_snr = float(
-                pulse.get("snr_db", -999.0)
-            )
-            if current_snr > previous_snr:
-                kept[-1] = pulse
-            continue
-
-        kept.append(pulse)
-
-    return kept
-
-
-def detect_and_refine_pulses_chunked(
-    y: np.ndarray,
-    sr: int,
-    max_windows: int | None = None,
-) -> tuple[int, list[dict[str, float]], float]:
-    """长录音抽窗检测与边界精修。
-
-    分窗策略（窗口时长 DETECTION_CHUNK_SECONDS）：
-    - 不足一个窗口：整段分析；
-    - 不超过 max_windows × 窗口时长：按窗口首尾相接连续覆盖全曲；
-    - 更长：在整条录音上均匀抽 max_windows 个窗口（首、中、尾都采样）。
-
-    默认 max_windows = MAX_ANALYSIS_WINDOWS_PER_RECORDING（演示/预测
-    只分析约 2×4 秒，显著缩短运行时间）。批量整理（⑥ curation）传入
-    CURATION_ANALYSIS_SPAN_S 推导出的更大窗口数，把分析跨度延长到
-    默认 60 秒，窗口之间不重叠部分仍由 remove_duplicate_boundary_pulses
-    兜底去重。
-    """
-    if max_windows is None:
-        max_windows = MAX_ANALYSIS_WINDOWS_PER_RECORDING
-    max_windows = max(1, int(max_windows))
-
-    chunk_samples = max(
-        int(round(DETECTION_CHUNK_SECONDS * sr)),
-        1,
-    )
-    audio_length = len(y)
-
-    if audio_length <= chunk_samples:
-        window_starts = [0]
-    elif (
-        audio_length
-        <= chunk_samples
-        * max_windows
-    ):
-        overlap_samples = max(
-            int(
-                round(
-                    DETECTION_CHUNK_OVERLAP_MS
-                    / 1000
-                    * sr
-                )
-            ),
-            1,
-        )
-        step_samples = max(
-            chunk_samples - overlap_samples,
-            1,
-        )
-        window_starts = list(
-            range(
-                0,
-                audio_length,
-                step_samples,
-            )
-        )
-        if (
-            window_starts
-            and window_starts[-1]
-            + chunk_samples
-            < audio_length
-        ):
-            window_starts.append(
-                max(
-                    0,
-                    audio_length
-                    - chunk_samples,
-                )
-            )
-    else:
-        last_start = max(
-            0,
-            audio_length - chunk_samples,
-        )
-        window_starts = [
-            int(round(value))
-            for value in np.linspace(
-                0,
-                last_start,
-                num=max_windows,
-            )
-        ]
-
-    window_starts = sorted(
-        set(int(value) for value in window_starts)
-    )
-
-    all_refined: list[dict[str, float]] = []
-    raw_candidate_count = 0
-    thresholds: list[float] = []
-
-    for start_sample in window_starts:
-        end_sample = min(
-            audio_length,
-            start_sample + chunk_samples,
-        )
-        chunk_y = y[start_sample:end_sample]
-
-        (
-            raw_pulses,
-            _,
-            _,
-            _,
-            threshold_db,
-        ) = detect_pulses(chunk_y, sr)
-        refined = refine_all_pulses(
-            chunk_y,
-            sr,
-            raw_pulses,
-        )
-
-        raw_candidate_count += len(raw_pulses)
-        thresholds.append(float(threshold_db))
-        offset_s = start_sample / sr
-
-        for pulse in refined:
-            adjusted = dict(pulse)
-            for key in (
-                "candidate_start_s",
-                "candidate_end_s",
-                "start_s",
-                "end_s",
-            ):
-                adjusted[key] = (
-                    float(adjusted[key])
-                    + offset_s
-                )
-            all_refined.append(adjusted)
-
-    refined_pulses = (
-        remove_duplicate_boundary_pulses(
-            all_refined
-        )
-    )
-    mean_threshold = (
-        float(np.mean(thresholds))
-        if thresholds
-        else float("nan")
-    )
-    return (
-        raw_candidate_count,
-        refined_pulses,
-        mean_threshold,
-    )

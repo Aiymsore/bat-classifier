@@ -1,26 +1,14 @@
-"""单脉冲特征提取与质量筛选（上游：detection 切出的脉冲波形；下游：聚类/门控/建表）。
-
-职责：频谱特征（峰值频率、带宽、斜率等）计算、通用质量门槛判断、
-accepted 布尔列兼容解析，以及训练表通用的数值列清洗工具。
+"""单脉冲频谱与轨迹特征提取，供模板匹配和声波建表使用。
 """
 
 from __future__ import annotations
 
 import librosa
 import numpy as np
-import pandas as pd
 from scipy.signal import medfilt
 
 from .audio_io import adaptive_stft_params, ultrasonic_band_mask
-from .config import (
-    CONTOUR_MIN_DB,
-    HIGH_FREQ_HZ,
-    LOW_FREQ_HZ,
-    MAX_TRACK_JUMP_KHZ,
-    MIN_PULSE_SNR_DB,
-    MIN_TRACK_COVERAGE,
-    TARGET_SAMPLE_RATE,
-)
+from .config import CONTOUR_MIN_DB
 
 
 def weighted_frequency_quantile(
@@ -162,56 +150,3 @@ def extract_pulse_features(
         "max_track_jump_khz": max_track_jump_khz,
         "rms": float(np.sqrt(np.mean(pulse_y**2))),
     }
-
-
-def evaluate_pulse_quality(
-    pulse: dict[str, float],
-    features: dict[str, float],
-) -> tuple[bool, str]:
-    """进行不依赖具体物种的通用质量筛选。"""
-    reasons: list[str] = []
-
-    if pulse["snr_db"] < MIN_PULSE_SNR_DB:
-        reasons.append("low_snr")
-
-    if features["track_coverage"] < MIN_TRACK_COVERAGE:
-        reasons.append("low_track_coverage")
-
-    if features["max_track_jump_khz"] > MAX_TRACK_JUMP_KHZ:
-        reasons.append("unstable_frequency_track")
-
-    if not (
-        LOW_FREQ_HZ / 1000
-        <= features["peak_freq_khz"]
-        <= min(HIGH_FREQ_HZ, TARGET_SAMPLE_RATE / 2) / 1000
-    ):
-        reasons.append("peak_frequency_out_of_range")
-
-    return len(reasons) == 0, ";".join(reasons)
-
-
-def accepted_mask(series: pd.Series) -> pd.Series:
-    """兼容布尔值和从CSV读取后的字符串布尔值。"""
-    if pd.api.types.is_bool_dtype(series):
-        return series.fillna(False)
-
-    return (
-        series.astype(str)
-        .str.strip()
-        .str.lower()
-        .isin({"true", "1", "yes"})
-    )
-
-
-def numeric_feature_frame(
-    data: pd.DataFrame,
-    columns: list[str],
-) -> pd.DataFrame:
-    """把特征列统一转为数值并把 ±inf 替换为 NaN，便于后续过滤。"""
-    frame = data[columns].copy()
-    for column in columns:
-        frame[column] = pd.to_numeric(
-            frame[column],
-            errors="coerce",
-        )
-    return frame.replace([np.inf, -np.inf], np.nan)

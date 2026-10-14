@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 import librosa
@@ -15,7 +14,7 @@ import numpy as np
 from scipy.signal import butter, sosfilt, sosfiltfilt
 
 from .config import (
-    DEMO_DETECTION_HOP_LENGTH,
+    DETECTION_HOP_LENGTH,
     HIGH_FREQ_HZ,
     LOW_FREQ_HZ,
     TARGET_SAMPLE_RATE,
@@ -68,31 +67,13 @@ def highpass_filter(
         return sosfilt(sos, y)
 
 
-def calculate_audio_content_hash(y: np.ndarray, sr: int) -> str:
-    """
-    对解码、统一采样率后的实际声音计算哈希。
-
-    即使两个WAV的文件头或元数据不同，只要解码后的声音采样值相同，
-    audio_hash仍会相同。
-    """
-    clean = np.asarray(y, dtype=np.float64)
-    clean = np.nan_to_num(clean, nan=0.0, posinf=0.0, neginf=0.0)
-    clean = np.clip(clean, -1.0, 1.0)
-    pcm16 = np.round(clean * 32767.0).astype("<i2")
-
-    digest = hashlib.sha256()
-    digest.update(str(int(sr)).encode("ascii"))
-    digest.update(pcm16.tobytes())
-    return digest.hexdigest()
-
-
 def build_spectrogram(
     y: np.ndarray,
     sr: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """演示检测用声谱图：步长256，保留约1毫秒时间分辨率并减少计算量。"""
     n_fft = 1024
-    hop_length = DEMO_DETECTION_HOP_LENGTH
+    hop_length = DETECTION_HOP_LENGTH
 
     stft = librosa.stft(
         y,

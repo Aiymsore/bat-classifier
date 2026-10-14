@@ -1,30 +1,18 @@
-"""⑦ 片段识别与叫声统计 页签。
-
-职责划分：
-- 本文件：输入选择（外部 WAV/文件夹）、模型状态、参数、按钮、进度、
-  片段级结果表格 + 选中片段详情 + 总体统计，以及把 SegmentAnalysisWorker 接到 Qt；
-- segment_analysis.py：全部科研算法（检测叫声 + 逐叫声分类 + 两级统计，脱离 Qt）；
-- workers.py：QThread 线程、进度/日志/异常转发、停止。
-
-业务语义（页面显式提示）：
-- 统计单位是“切割后的 WAV 片段”，一段内可能含 N 次叫声；
-- 统计的是声学 call 数量，不代表蝙蝠个体数量；
-- 当前部署的是临时声型（A-D）模型时，明确标注“不是专家确认物种模型”。
-"""
+"""① 模板声波匹配、片段识别与叫声统计。"""
 
 from __future__ import annotations
 
 from pathlib import Path
+import tempfile
 from typing import Callable
 
-from PySide6.QtCore import Qt, Signal, QUrl
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import (
     QDesktopServices,
     QStandardItem,
     QStandardItemModel,
 )
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -44,45 +32,34 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import (
-    COMBINED_DEMO_MODEL_PATH,
-    SEGMENT_LOW_CONFIDENCE_ACTION,
     SEGMENT_MIN_CONFIDENCE,
     SEGMENT_MIXED_PURITY_THRESHOLD,
-    SEGMENT_UNCERTAIN_LABEL,
 )
-from .model_picker import ModelPicker
 from .ui_utils import make_scrollable
 
 
 class SegmentAnalysisTab(QWidget):
-    """⑦ 页面：输入 + 模型状态 + 参数 + 进度 + 片段/总体统计。"""
+    """① 页面：输入 + 模型状态 + 参数 + 进度 + 片段/总体统计。"""
 
-    # 当前使用的模型发生变化（供 ③/④ 同步选择）
-    model_changed = Signal(str)
 
     def __init__(
         self,
         log: Callable[[str], None],
         track_worker: Callable[[object], None],
         parent: QWidget | None = None,
-        initial_model_path: str = "",
     ) -> None:
         super().__init__(parent)
         self._log = log
         self._track_worker = track_worker
         self._input_path: Path | None = None
         self._worker = None
-        self._combined_payload: dict | None = None
-        self._model_loaded = False
-        self._loaded_model_path: str = ""
-        self._initial_model_path = str(initial_model_path)
         self._run_dir: Path | None = None
         self._labels: list[str] = []
-        self._uncertain_label: str = SEGMENT_UNCERTAIN_LABEL
+        self._uncertain_label: str = "unknown"
         self._segment_rows: list[dict] = []
+        self._template_dir: Path | None = None
 
         self._build_ui()
-        self._refresh_model_status()
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self) -> None:
@@ -93,37 +70,24 @@ class SegmentAnalysisTab(QWidget):
         form_layout = QVBoxLayout(form)
         form_layout.setContentsMargins(0, 0, 0, 0)
 
-        # ---- 模型状态 ----
-        model_group = QGroupBox("模型状态")
-        model_layout = QGridLayout()
-        self._model_status_label = QLabel("模型状态：检查中…")
-        self._model_status_label.setWordWrap(True)
-        self._model_path_label = QLabel("")
-        self._model_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self._model_warning_label = QLabel("")
-        self._model_warning_label.setWordWrap(True)
-        self._model_warning_label.setStyleSheet("color: #b06000;")
-        self._calibration_label = QLabel("")
-        self._calibration_label.setWordWrap(True)
-        model_layout.addWidget(self._model_status_label, 0, 0, 1, 3)
-        model_layout.addWidget(self._model_path_label, 1, 0, 1, 3)
-        model_layout.addWidget(self._model_warning_label, 2, 0, 1, 3)
-        model_layout.addWidget(self._calibration_label, 3, 0, 1, 3)
-
-        model_layout.addWidget(
-            QLabel("使用模型（② 训练的模型 / 已导入的模型，可随时切换）"),
-            4,
-            0,
-            1,
-            3,
+        # ---- 模板注入（第七模块独立推理模式） ----
+        template_group = QGroupBox("模板声波注入（按可信文件名自动合并样本）")
+        template_layout = QGridLayout()
+        self._template_edit = QLineEdit()
+        self._template_edit.setReadOnly(True)
+        self._template_edit.setPlaceholderText(
+            "例如 CF1_47K1、CF1_47K2 会合并为模板类别 CF1_47K。"
         )
-        self._model_picker = ModelPicker(
-            self._initial_model_path, log=self._log
-        )
-        model_layout.addWidget(self._model_picker, 5, 0, 1, 3)
-        self._model_picker.model_changed.connect(self._on_model_changed)
-        model_group.setLayout(model_layout)
-        form_layout.addWidget(model_group)
+        template_button = QPushButton("选择模板文件夹")
+        template_button.clicked.connect(self._pick_template_folder)
+        self._template_status = QLabel("请选择模板文件夹；模板文件名决定类别。")
+        self._template_status.setWordWrap(True)
+        self._template_status.setStyleSheet("color: #555;")
+        template_layout.addWidget(self._template_edit, 0, 0, 1, 3)
+        template_layout.addWidget(template_button, 1, 0)
+        template_layout.addWidget(self._template_status, 1, 1, 1, 2)
+        template_group.setLayout(template_layout)
+        form_layout.addWidget(template_group)
 
         # ---- 输入数据 ----
         input_group = QGroupBox("输入数据（已切割好的 WAV 片段）")
@@ -148,13 +112,8 @@ class SegmentAnalysisTab(QWidget):
         # ---- 参数 ----
         params_group = QGroupBox("叫声检测与分类参数")
         params_layout = QGridLayout()
-        self._quality_check = QCheckBox(
-            "使用质量筛选后的有效 pulse 计数"
-        )
-        self._quality_check.setChecked(True)
-        params_layout.addWidget(self._quality_check, 0, 0, 1, 3)
-
-        params_layout.addWidget(QLabel("最低置信度"), 1, 0)
+        self._confidence_label = QLabel("最低相似度")
+        params_layout.addWidget(self._confidence_label, 1, 0)
         self._confidence_spin = QDoubleSpinBox()
         self._confidence_spin.setRange(0.0, 1.0)
         self._confidence_spin.setSingleStep(0.05)
@@ -162,20 +121,42 @@ class SegmentAnalysisTab(QWidget):
         self._confidence_spin.setValue(SEGMENT_MIN_CONFIDENCE)
         params_layout.addWidget(self._confidence_spin, 1, 1)
 
-        params_layout.addWidget(QLabel("低于该置信度"), 2, 0)
-        self._low_conf_combo = QComboBox()
-        self._low_conf_combo.addItem("标记为 uncertain", "uncertain")
-        self._low_conf_combo.addItem("保留模型原标签", "keep")
-        if SEGMENT_LOW_CONFIDENCE_ACTION == "keep":
-            self._low_conf_combo.setCurrentIndex(1)
-        params_layout.addWidget(self._low_conf_combo, 2, 1)
+        params_layout.addWidget(QLabel("低于最低相似度的声波归入 unknown。"), 2, 0, 1, 4)
 
-        self._save_audio_check = QCheckBox("导出每段独立叫声 WAV（segments/<段>/）")
-        self._save_audio_check.setChecked(True)
-        self._save_figure_check = QCheckBox("生成片段声谱图 + 叫声标注（figures/）")
-        self._save_figure_check.setChecked(True)
-        params_layout.addWidget(self._save_audio_check, 3, 0, 1, 2)
-        params_layout.addWidget(self._save_figure_check, 3, 2, 1, 2)
+        params_layout.addWidget(QLabel("同时分量分离窗"), 3, 0)
+        self._separation_window_combo = QComboBox()
+        self._separation_window_combo.addItem(
+            "固定 256 点（当前）", "fixed"
+        )
+        self._separation_window_combo.addItem(
+            "自适应延长（长分量 512/1024 点）", "adaptive"
+        )
+        self._separation_window_combo.setToolTip(
+            "固定模式保持旧结果；自适应模式对较长叫声延长频谱分析窗，"
+            "同时保留至少约 3 个分析窗。"
+        )
+        params_layout.addWidget(self._separation_window_combo, 3, 1, 1, 3)
+        params_layout.addWidget(QLabel("谐波处理"), 4, 0)
+        self._harmonic_grouping_combo = QComboBox()
+        self._harmonic_grouping_combo.addItem(
+            "增强（倍率+轨迹+包络）", "enhanced"
+        )
+        self._harmonic_grouping_combo.addItem(
+            "基础（仅 2/3 倍率）", "basic"
+        )
+        self._harmonic_grouping_combo.setToolTip(
+            "增强模式把可信谐波并入同一分量，不再单独计数；基础模式保留旧判断。"
+        )
+        params_layout.addWidget(self._harmonic_grouping_combo, 4, 1, 1, 3)
+        params_layout.addWidget(QLabel("声谱图输出方式"), 5, 0)
+        self._pulse_spectrogram_mode_combo = QComboBox()
+        self._pulse_spectrogram_mode_combo.addItem("合并显示（同一时间候选共图）", "merged")
+        self._pulse_spectrogram_mode_combo.addItem("分开显示（每个独立分量一图）", "separate")
+        self._pulse_spectrogram_mode_combo.setToolTip(
+            "分开模式使用分量音频，谐波随所属叫声一起显示。"
+            "未可靠分离的候选保留原图并注明；两种方式的计数和分类一致。"
+        )
+        params_layout.addWidget(self._pulse_spectrogram_mode_combo, 5, 1, 1, 3)
         params_group.setLayout(params_layout)
         form_layout.addWidget(params_group)
 
@@ -234,10 +215,25 @@ class SegmentAnalysisTab(QWidget):
         self._detail_view = QPlainTextEdit()
         self._detail_view.setReadOnly(True)
         detail_layout.addWidget(self._detail_view)
-        self._figure_button = QPushButton("查看片段声谱图")
+        self._figure_button = QPushButton("查看片段线性声谱图")
         self._figure_button.setEnabled(False)
         self._figure_button.clicked.connect(self._open_figure)
         detail_layout.addWidget(self._figure_button)
+        self._pulse_figure_button = QPushButton(
+            "查看逐声波声谱图（按类别）"
+        )
+        self._pulse_figure_button.setEnabled(False)
+        self._pulse_figure_button.setToolTip(
+            "查看当前 WAV 中每个类别的独立声谱图，也包含 unknown。"
+        )
+        self._pulse_figure_button.clicked.connect(self._open_pulse_figures)
+        detail_layout.addWidget(self._pulse_figure_button)
+        self._direct_button = QPushButton("直接打开 WAV/SON 查看…")
+        self._direct_button.setToolTip(
+            "不跑分析，直接渲染任意 WAV 或 Avisoto SASLab 的 .son 声谱图"
+        )
+        self._direct_button.clicked.connect(self._open_direct_file)
+        detail_layout.addWidget(self._direct_button)
         detail_group.setLayout(detail_layout)
         right_layout.addWidget(detail_group, stretch=2)
 
@@ -272,109 +268,6 @@ class SegmentAnalysisTab(QWidget):
         hint.setWordWrap(True)
         root.addWidget(hint)
 
-    # ------------------------------------------------------------- 模型状态
-    def _ensure_model(self) -> dict | None:
-        path = self._model_picker.current_path_text()
-        if self._model_loaded and path == self._loaded_model_path:
-            return self._combined_payload
-        try:
-            from ..segment_analysis import load_classification_model
-
-            self._combined_payload = load_classification_model(
-                Path(path) if path else None
-            )
-        except Exception as error:  # noqa: BLE001
-            self._combined_payload = None
-            self._log(f"加载分类模型失败：{error}")
-        self._model_loaded = True
-        self._loaded_model_path = path
-        return self._combined_payload
-
-    def _invalidate_model(self) -> None:
-        """强制下次 _ensure_model 重新读盘（换模型 / 重新训练后调用）。"""
-        self._model_loaded = False
-        self._combined_payload = None
-        self._loaded_model_path = ""
-
-    def _on_model_changed(self, path: str) -> None:
-        self._invalidate_model()
-        self._refresh_model_status()
-        self.model_changed.emit(str(path))
-        self._log(f"⑦ 当前使用模型：{path}")
-
-    def refresh_models(self) -> None:
-        """外部（如 ② 训练完成、④ 导入模型）触发：重扫模型并刷新状态。"""
-        current = self._model_picker.current_path_text()
-        self._model_picker.refresh(current)
-        self._invalidate_model()
-        self._refresh_model_status()
-
-    def current_model_path(self) -> str:
-        return self._model_picker.current_path_text()
-
-    @property
-    def model_picker(self) -> ModelPicker:
-        """供主窗口与其他页签同步“当前使用模型”的选择。"""
-        return self._model_picker
-
-    def _refresh_model_status(self) -> None:
-        from ..segment_analysis import describe_model
-
-        payload = self._ensure_model()
-        info = describe_model(
-            payload, model_path=self._model_picker.current_path_text()
-        )
-        self._labels = list(info.get("labels") or [])
-
-        # 置信度性质：校准概率 vs 未校准的模型支持度（绝不含糊）
-        if info["loaded"] and info.get("is_calibrated"):
-            self._calibration_label.setStyleSheet("color: #1b5e20;")
-            self._calibration_label.setText(
-                f"置信度：校准概率（CalibratedClassifierCV, "
-                f"method={info.get('calibration_method') or '未标注'}）。"
-            )
-        elif info["loaded"]:
-            self._calibration_label.setStyleSheet("color: #b06000;")
-            self._calibration_label.setText(
-                "置信度：未校准——为分类器原始 predict_proba（模型支持度），"
-                "不能当“预测正确的概率”读；"
-                "可在 ② 训练时自动生成校准器，或用“补校准”功能添加。"
-            )
-        else:
-            self._calibration_label.setText("")
-
-        if info["loaded"]:
-            origin = (
-                "② 训练模型"
-                if Path(str(info.get("model_path", ""))).name
-                == COMBINED_DEMO_MODEL_PATH.name
-                else "导入/其他模型"
-            )
-            self._model_status_label.setText(
-                f"物种分类模型：已加载（来源：{origin}，可分类）"
-            )
-            self._model_path_label.setText(
-                f"模型路径：{info.get('model_path', '')}"
-            )
-        else:
-            self._model_status_label.setText(
-                "未检测到可用分类模型。此时仅可运行“叫声检测与计数”"
-                "（label = unavailable）。"
-            )
-            self._model_path_label.setText(
-                f"期望模型文件：{info.get('model_path', '')}"
-            )
-
-        if info.get("is_temporary_acoustic_model"):
-            self._model_warning_label.setText(
-                "⚠ 当前模型为临时声型模型（A-D 声学相似类型），"
-                "不是专家确认物种模型。"
-            )
-        else:
-            self._model_warning_label.setText(
-                info.get("warning", "") or ""
-            )
-
     # ------------------------------------------------------------- 输入
     def _pick_wav(self) -> None:
         chosen, _ = QFileDialog.getOpenFileName(
@@ -387,6 +280,32 @@ class SegmentAnalysisTab(QWidget):
         chosen = QFileDialog.getExistingDirectory(self, "选择 WAV 文件夹")
         if chosen:
             self._set_input(Path(chosen))
+
+    def _pick_template_folder(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "选择模板声波文件夹")
+        if not chosen:
+            return
+        path = Path(chosen)
+        try:
+            from ..template_matching import discover_template_groups
+
+            groups = discover_template_groups(path)
+            self._template_dir = path
+            self._template_edit.setText(str(path))
+            details = "；".join(
+                f"{label}（{len(files)}）"
+                for label, files in groups.items()
+            )
+            self._template_status.setText(
+                f"识别到 {len(groups)} 个模板类别、"
+                f"{sum(len(files) for files in groups.values())} 个 WAV：{details}"
+            )
+            self._log(f"模板目录已选择：{path}（{len(groups)} 类）")
+        except Exception as error:  # noqa: BLE001
+            self._template_dir = None
+            self._template_edit.clear()
+            self._template_status.setText(f"模板读取失败：{error}")
+            QMessageBox.warning(self, "模板读取失败", str(error))
 
     def _set_input(self, path: Path) -> None:
         self._input_path = path
@@ -407,12 +326,18 @@ class SegmentAnalysisTab(QWidget):
     def _collect_config(self) -> dict:
         return {
             "min_confidence": float(self._confidence_spin.value()),
-            "low_confidence_action": str(self._low_conf_combo.currentData()),
-            "use_quality_filter": bool(self._quality_check.isChecked()),
-            "save_pulse_audio": bool(self._save_audio_check.isChecked()),
-            "save_figures": bool(self._save_figure_check.isChecked()),
-            "uncertain_label": SEGMENT_UNCERTAIN_LABEL,
+            "save_pulse_audio": True,
+            "save_figures": True,
+            "save_pulse_spectrograms": True,
+            "pulse_spectrogram_mode": str(self._pulse_spectrogram_mode_combo.currentData()),
+            "separation_window_mode": str(
+                self._separation_window_combo.currentData()
+            ),
+            "harmonic_grouping_mode": str(
+                self._harmonic_grouping_combo.currentData()
+            ),
             "mixed_purity_threshold": SEGMENT_MIXED_PURITY_THRESHOLD,
+            "template_unknown_label": "unknown",
         }
 
     def _start(self) -> None:
@@ -423,9 +348,11 @@ class SegmentAnalysisTab(QWidget):
             QMessageBox.warning(self, "提示", f"路径不存在：{self._input_path}")
             return
 
-        from .workers import SegmentAnalysisWorker
+        if self._template_dir is None or not self._template_dir.is_dir():
+            QMessageBox.warning(self, "提示", "请先选择模板文件夹。")
+            return
 
-        payload = self._ensure_model()
+        from .workers import SegmentAnalysisWorker
 
         # ---- 断点续跑（§12）：上次未完成且有 checkpoint 时明确询问 ----
         resume: bool | None = None
@@ -459,14 +386,14 @@ class SegmentAnalysisTab(QWidget):
         self._detail_view.clear()
         self._overall_view.clear()
         self._figure_button.setEnabled(False)
+        self._pulse_figure_button.setEnabled(False)
 
         worker = SegmentAnalysisWorker(
             self._input_path,
-            payload,
             self._collect_config(),
             output_root=output_root,
-            model_path=self._model_picker.current_path_text(),
             resume=resume,
+            template_dir=self._template_dir,
         )
         self._worker = worker
         worker.progress.connect(self._on_progress)
@@ -489,6 +416,9 @@ class SegmentAnalysisTab(QWidget):
     def _set_busy(self, busy: bool) -> None:
         self._start_button.setEnabled(not busy)
         self._stop_button.setEnabled(busy)
+        self._separation_window_combo.setEnabled(not busy)
+        self._harmonic_grouping_combo.setEnabled(not busy)
+        self._pulse_spectrogram_mode_combo.setEnabled(not busy)
 
     # ------------------------------------------------------------- 进度回调
     def _on_progress(self, current: int, total: int, current_file: str) -> None:
@@ -497,7 +427,7 @@ class SegmentAnalysisTab(QWidget):
         )
 
     def _on_chunk_progress(self, payload: object) -> None:
-        """⑦ 长录音块级进度（§13）：已处理时长/速度/已检测 call/分块。"""
+        """① 长录音块级进度（§13）：已处理时长/速度/已检测 call/分块。"""
         if not isinstance(payload, dict):
             return
         duration = float(payload.get("recording_duration_s", 0.0))
@@ -548,7 +478,7 @@ class SegmentAnalysisTab(QWidget):
         self._segment_rows = list(result.get("segment_results", []))
         self._labels = list(result.get("labels") or [])
         self._uncertain_label = str(
-            result.get("uncertain_label") or SEGMENT_UNCERTAIN_LABEL
+            result.get("uncertain_label") or "unknown"
         )
 
         success = result.get("success_count", 0)
@@ -620,6 +550,10 @@ class SegmentAnalysisTab(QWidget):
             self._run_dir is not None
             and (self._run_dir / "figures" / f"{result.get('segment_id', '')}.png").exists()
         )
+        self._pulse_figure_button.setEnabled(
+            self._run_dir is not None
+            and (self._run_dir / "pulse_predictions.csv").exists()
+        )
 
     def _show_detail(self, result: dict) -> None:
         label_counts = result.get("label_counts", {}) or {}
@@ -630,9 +564,9 @@ class SegmentAnalysisTab(QWidget):
             f"时长：{duration:.2f} s",
             f"有效监测时长：{float(result.get('valid_monitoring_duration_s', duration)):.2f} s",
             f"检测候选：{result.get('candidate_call_count', 0)}",
-            f"通过质量筛选：{result.get('valid_call_count', 0)}",
             f"噪声（不计入叫声）：{result.get('noise_count', 0)}",
             f"有效蝙蝠叫声：{result.get('detected_call_count', 0)}",
+            f"输出声谱图：{result.get('exported_pulse_spectrogram_count', 0)} 张",
             f"叫声频率：{result.get('calls_per_second', 0.0):.2f} 次/秒"
             f"（分母 = 有效监测时长）",
             f"分块：{result.get('processed_chunk_count', 0)} 块处理 / "
@@ -678,11 +612,114 @@ class SegmentAnalysisTab(QWidget):
         row = index.row() if index.isValid() else -1
         if row < 0 or row >= len(self._segment_rows):
             return
-        segment_id = self._segment_rows[row].get("segment_id", "")
+        segment = self._segment_rows[row]
+        segment_id = segment.get("segment_id", "")
         figure_path = self._run_dir / "figures" / f"{segment_id}.png"
         if not figure_path.exists():
             QMessageBox.information(self, "提示", "该片段没有生成声谱图。")
             return
+
+        # 交互式查看：PNG 上叠加可移动频率光标（读出图时的几何 sidecar）
+        from .linear_spectrogram_view import (
+            LinearSpectrogramDialog,
+            load_spectrogram_meta,
+        )
+
+        meta = load_spectrogram_meta(figure_path)
+        if meta is not None:
+            dialog = LinearSpectrogramDialog(
+                figure_path,
+                meta,
+                title=f"{segment.get('segment_file', '')} | 片段线性声谱图",
+                parent=self,
+            )
+            dialog.exec()
+            return
+
+        # 老图（改动前生成）没有 sidecar → 回退静态查看
+        self._log(
+            f"{figure_path.name} 缺少频率光标几何信息（旧版本生成），"
+            "以静态图片方式打开；重新跑一次分析即可获得光标。"
+        )
+        from .image_viewer import ImagePreviewDialog
+
+        dialog = ImagePreviewDialog(figure_path, self)
+        dialog.exec()
+
+    def _open_pulse_figures(self) -> None:
+        """打开当前 WAV 的逐 pulse 分类声谱图浏览器。"""
+        if self._run_dir is None:
+            return
+        index = self._result_table.currentIndex()
+        row = index.row() if index.isValid() else -1
+        if row < 0 or row >= len(self._segment_rows):
+            return
+        result = self._segment_rows[row]
+        from .image_viewer import PulseSpectrogramDialog
+
+        dialog = PulseSpectrogramDialog(
+            self._run_dir,
+            labels=self._labels,
+            unknown_label=self._uncertain_label,
+            segment_id=str(result.get("segment_id", "")),
+            parent=self,
+        )
+        dialog.exec()
+
+    def _open_direct_file(self) -> None:
+        """① 直接查看：不跑分析，选一个 WAV 或 SON 渲染声谱图并打开。"""
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择要查看的音频文件",
+            "",
+            "音频/声谱文件 (*.wav *.son);;WAV (*.wav);;SASLab SON (*.son)",
+        )
+        if not chosen:
+            return
+        source = Path(chosen)
+        suffix = source.suffix.lower()
+        if suffix not in {".wav", ".son"}:
+            QMessageBox.warning(self, "提示", "只支持 .wav 或 .son 文件。")
+            return
+
+        from ..visualization import save_direct_overview
+
+        cache_dir = Path(tempfile.gettempdir()) / "bat_classifier_quick_view"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        figure_path = cache_dir / f"{source.stem}_direct.png"
+        try:
+            ok = save_direct_overview(
+                source,
+                figure_path,
+                title=f"{source.name} | 直接查看",
+            )
+        except Exception as error:  # noqa: BLE001 - 文件损坏/格式不符要给出提示
+            QMessageBox.critical(
+                self,
+                "打开失败",
+                f"无法渲染 {source.name}：\n{error}",
+            )
+            return
+        if not ok:
+            QMessageBox.warning(self, "提示", "未能从该文件生成声谱图。")
+            return
+
+        from .linear_spectrogram_view import (
+            LinearSpectrogramDialog,
+            load_spectrogram_meta,
+        )
+
+        meta = load_spectrogram_meta(figure_path)
+        if meta is not None:
+            dialog = LinearSpectrogramDialog(
+                figure_path,
+                meta,
+                title=f"{source.name} | 线性声谱图（直接查看）",
+                parent=self,
+            )
+            dialog.exec()
+            return
+
         from .image_viewer import ImagePreviewDialog
 
         dialog = ImagePreviewDialog(figure_path, self)
@@ -711,6 +748,14 @@ class SegmentAnalysisTab(QWidget):
                 if source.exists():
                     shutil.copy2(source, target_dir / name)
                     copied.append(name)
+            pulse_dir = self._run_dir / "pulse_spectrograms"
+            if pulse_dir.is_dir():
+                shutil.copytree(
+                    pulse_dir,
+                    target_dir / "pulse_spectrograms",
+                    dirs_exist_ok=True,
+                )
+                copied.append("pulse_spectrograms/")
             self._log(f"已导出结果到 {target_dir}：{', '.join(copied)}")
         except Exception as error:  # noqa: BLE001
             QMessageBox.critical(self, "导出失败", str(error))

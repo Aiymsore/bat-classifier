@@ -1,4 +1,4 @@
-from .pipeline import main
+from .app import run_app
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(run_app())
