@@ -67,6 +67,46 @@ def highpass_filter(
         return sosfilt(sos, y)
 
 
+def load_audio_interval(
+    audio_path: Path,
+    start_s: float,
+    end_s: float,
+    *,
+    preprocessed: bool = False,
+) -> tuple[np.ndarray, int, float]:
+    """定位读取 WAV 小区间；滤波/重采样留边后裁回选区，不载入整条录音。"""
+    import soundfile as sf
+
+    if not np.isfinite(start_s) or not np.isfinite(end_s) or end_s <= start_s:
+        raise ValueError("时间选区无效")
+    with sf.SoundFile(str(audio_path), "r") as handle:
+        source_sr = int(handle.samplerate)
+        duration_s = len(handle) / float(source_sr)
+        start_s = max(0.0, float(start_s))
+        end_s = min(duration_s, float(end_s))
+        if end_s <= start_s:
+            raise ValueError("选区超出 WAV 的时间范围")
+        # 两侧仅用于抑制边缘瞬态，不增加最终显示区间。
+        margin = int(round(0.05 * source_sr))
+        read_start = max(0, int(np.floor(start_s * source_sr)) - margin)
+        read_end = min(len(handle), int(np.ceil(end_s * source_sr)) + margin)
+        handle.seek(read_start)
+        raw = handle.read(read_end - read_start, dtype="float64", always_2d=True)
+    y = np.asarray(raw.mean(axis=1), dtype=np.float64)
+    y = np.where(np.isfinite(y), y, 0.0)
+    if source_sr != TARGET_SAMPLE_RATE:
+        y = librosa.resample(y, orig_sr=source_sr, target_sr=TARGET_SAMPLE_RATE)
+    if not preprocessed:
+        y = highpass_filter(y - np.mean(y), TARGET_SAMPLE_RATE)
+    read_offset_s = read_start / float(source_sr)
+    first = max(0, int(round((start_s - read_offset_s) * TARGET_SAMPLE_RATE)))
+    last = min(len(y), int(round((end_s - read_offset_s) * TARGET_SAMPLE_RATE)))
+    selected = y[first:last]
+    if len(selected) < 64:
+        raise ValueError("选区过短，请选择至少 0.3 毫秒的声音")
+    return selected, TARGET_SAMPLE_RATE, read_offset_s + first / float(TARGET_SAMPLE_RATE)
+
+
 def build_spectrogram(
     y: np.ndarray,
     sr: int,

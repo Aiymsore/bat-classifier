@@ -7,7 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-from .features import extract_pulse_features
+from .features import compute_pulse_spectrum, extract_pulse_features
+from .morphology_gate import score_morphology, unavailable_gate
 from .separation import (
     _unchanged_component,
     save_separated_pulse,
@@ -96,16 +97,28 @@ def create_pulse_rows(
             cached_features = component.get(
                 "_preview_features"
             )
+            spectrum = None
             if cached_features is not None:
                 features = dict(cached_features)
+                try:
+                    spectrum = compute_pulse_spectrum(component_audio, sr)
+                except Exception:
+                    pass
             else:
                 try:
+                    spectrum = compute_pulse_spectrum(component_audio, sr)
                     features = extract_pulse_features(
                         component_audio,
                         sr,
+                        spectrum=spectrum,
                     )
                 except Exception:
                     continue
+
+            if spectrum is not None and component.get('_boundary_track') is not None:
+                from .features import with_observed_support
+                spectrum = with_observed_support(spectrum,component['_boundary_track'])
+                features = extract_pulse_features(component_audio,sr,spectrum=spectrum)
 
             template_track = None
             if include_template_track:
@@ -116,6 +129,8 @@ def create_pulse_rows(
                     template_track = extract_template_descriptor(
                         component_audio,
                         sr,
+                        spectrum=spectrum,
+                        pulse_features=features if cached_features is None else None,
                     ).get("template_track_khz")
                 except Exception:
                     template_track = None
@@ -131,6 +146,16 @@ def create_pulse_rows(
                 pulse_start_sample
                 + int(component["end_sample"])
             )
+            try:
+                if spectrum is None:
+                    spectrum = compute_pulse_spectrum(component_audio, sr)
+                gate = score_morphology(
+                    spectrum, component=component, context_audio=y,
+                    start_sample=component_start_sample, end_sample=component_end_sample,
+                )
+            except Exception as error:
+                # 门控失败不能默认为 bat 或丢弃；仍保留建表和模板结果。
+                gate = unavailable_gate(f"门控材料不可用：{type(error).__name__}")
             component_pulse = dict(pulse)
             component_pulse["start_s"] = (
                 component_start_sample / sr
@@ -210,6 +235,8 @@ def create_pulse_rows(
                     "candidate_end_s": float(
                         pulse["candidate_end_s"]
                     ),
+                    **{key: pulse[key] for key in ('core_start_s','core_end_s',
+                        'boundary_start_s','boundary_end_s','boundary_method') if key in pulse},
                     "start_s": float(
                         component_pulse["start_s"]
                     ),
@@ -225,7 +252,9 @@ def create_pulse_rows(
                     "core_threshold_db": float(
                         pulse["core_threshold_db"]
                     ),
+                    "detect_source": str(pulse.get("detect_source", "fullband")),
                     **features,
+                    **gate,
                 }
             if template_track is not None:
                 row["template_track_khz"] = template_track

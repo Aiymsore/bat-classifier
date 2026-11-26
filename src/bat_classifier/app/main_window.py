@@ -1,9 +1,10 @@
-"""模板匹配统计与低相似度初筛的双页主窗口。"""
+"""片段识别与叫声统计主窗口。"""
 
 from __future__ import annotations
 
+from pathlib import Path
 
-from PySide6.QtCore import QRect
+from PySide6.QtCore import QEvent, QRect, Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -19,7 +20,6 @@ from PySide6.QtWidgets import (
 )
 
 from .segment_analysis_tab import SegmentAnalysisTab
-from .noise_template_scan_tab import NoiseTemplateScanTab
 from .settings import AppSettings
 
 
@@ -50,8 +50,6 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         self._segment_tab = self._build_segment_tab()
         tabs.addTab(self._segment_tab, "① 片段识别与叫声统计")
-        self._noise_scan_tab = NoiseTemplateScanTab(log=self._append_log, track_worker=self._track_worker)
-        tabs.addTab(self._noise_scan_tab, "② 噪声模板初筛")
 
 
         central = QWidget()
@@ -62,6 +60,39 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self._append_log(f"工作区：{self._settings.workspace}")
+        self.setAcceptDrops(True)
+        # 在子控件之前接收文件拖入，避免只读文本框和表格吞掉拖放事件。
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop}
+            and isinstance(watched, QWidget)
+            and watched.window() is self
+            and event.mimeData().hasUrls()
+        ):
+            paths = list(dict.fromkeys(
+                Path(url.toLocalFile()) for url in event.mimeData().urls()
+                if url.isLocalFile()
+            ))
+            supported = [path for path in paths if path.is_dir() or (
+                path.is_file() and path.suffix.lower() in {".wav", ".son", ".png"}
+            )]
+            if supported:
+                event.setDropAction(Qt.DropAction.CopyAction)
+                event.accept()
+                if event.type() == QEvent.Type.Drop:
+                    # 先完成系统拖放，再打开模态查看窗口。
+                    QTimer.singleShot(0, lambda: self._open_dropped_paths(supported))
+                return True
+        return super().eventFilter(watched, event)
+
+    def _open_dropped_paths(self, paths: list[Path]) -> None:
+        for path in paths:
+            if path.is_dir() or path.suffix.lower() == ".png":
+                self._segment_tab.open_png_path(path)
+            else:
+                self._segment_tab.open_direct_path(path)
 
 
     def _apply_window_geometry(self) -> None:

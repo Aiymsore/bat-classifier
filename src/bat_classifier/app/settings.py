@@ -42,6 +42,10 @@ class AppSettings:
 
         self.workspace.mkdir(parents=True, exist_ok=True)
         os.environ["BAT_WORKSPACE"] = str(self.workspace)
+        os.environ["NUMBA_CACHE_DIR"] = str(self.workspace / ".cache" / "numba")
+        os.environ["NUMBA_CACHE_LOCATOR_CLASSES"] = (
+            "bat_classifier.runtime_cache.WorkspaceCacheLocator"
+        )
 
     def save(self) -> None:
         self.workspace.mkdir(parents=True, exist_ok=True)

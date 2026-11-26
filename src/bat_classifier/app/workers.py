@@ -13,6 +13,8 @@ from __future__ import annotations
 import contextlib
 import io
 import threading
+import traceback
+from concurrent.futures import CancelledError
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -51,6 +53,7 @@ class _LoggedWorker(QThread):
     log = Signal(str)
     done = Signal(object)
     failed = Signal(str)
+    cancelled = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -68,7 +71,11 @@ class _LoggedWorker(QThread):
         try:
             with contextlib.redirect_stdout(stream):
                 result = function()
+        except CancelledError as error:
+            self.cancelled.emit(str(error))
+            return
         except Exception as error:  # noqa: BLE001 - 工作线程兜底
+            self.log.emit(traceback.format_exc())
             self.failed.emit(f"{type(error).__name__}: {error}")
             return
         self.done.emit(result)
@@ -129,14 +136,9 @@ class SegmentAnalysisWorker(_LoggedWorker):
         return self._stop_event.is_set()
 
     def run(self) -> None:
-        from dataclasses import fields
-
-        from ..segment_analysis import (
-            SegmentAnalysisConfig,
-            analyze_segment_folder,
-        )
-
         def job() -> dict:
+            from dataclasses import fields
+            from ..segment_analysis import SegmentAnalysisConfig, analyze_segment_folder
             known = {field.name for field in fields(SegmentAnalysisConfig)}
             config = SegmentAnalysisConfig(
                 **{
@@ -153,6 +155,9 @@ class SegmentAnalysisWorker(_LoggedWorker):
                 print(f"正在加载模板目录：{self._template_dir}")
                 template_payload = build_template_model(
                     self._template_dir,
+                    progress=lambda current, total, name: self.log.emit(
+                        f"加载模板 {current}/{total}：{name}"),
+                    should_stop=self._should_stop,
                     min_similarity=float(
                         self._config.get(
                             "min_confidence", 0.60
@@ -181,30 +186,3 @@ class SegmentAnalysisWorker(_LoggedWorker):
             )
 
         self._run_logged(job)
-
-
-class LowSimilarityScanWorker(_LoggedWorker):
-    """② 第一次模板扫描；只导出低分 pulse，候选由页面人工选择。"""
-
-    progress = Signal(int, int, str)
-    chunk_progress = Signal(object)
-
-    def __init__(self, input_path: Path, template_dir: Path, threshold: float, config: dict, parent=None):
-        super().__init__(parent)
-        self.input_path = Path(input_path)
-        self.template_dir = Path(template_dir)
-        self.threshold = float(threshold)
-        self.config = dict(config)
-
-
-    def run(self) -> None:
-        from ..noise_template_scan import scan_low_similarity_pulses
-        from ..segment_analysis import SegmentAnalysisConfig
-
-        self._run_logged(lambda: scan_low_similarity_pulses(
-            self.input_path, self.template_dir, similarity_threshold=self.threshold,
-            analysis_config=SegmentAnalysisConfig(**self.config),
-            progress=lambda current, total, name: self.progress.emit(current, total, name),
-            chunk_progress=lambda payload: self.chunk_progress.emit(payload),
-            should_stop=self._stop_event.is_set,
-        ))

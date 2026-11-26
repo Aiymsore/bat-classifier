@@ -1,6 +1,6 @@
 """结果图像查看组件：大图对话框 + 列表/预览画廊。
 
-供第①、第②模块浏览声谱图使用。
+供片段识别与叫声统计浏览声谱图使用。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QPushButton,
     QScrollArea,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -223,9 +224,13 @@ class ImageGalleryPane(QWidget):
         self,
         empty_hint: str = "没有找到图像。",
         parent: QWidget | None = None,
+        *,
+        frequency_cursor: bool = False,
     ) -> None:
         super().__init__(parent)
         self._paths: list[Path] = []
+        self._frequency_cursor = frequency_cursor
+        self._linear_view = None
 
         self._list = QListWidget()
         self._list.setMaximumWidth(360)
@@ -242,6 +247,11 @@ class ImageGalleryPane(QWidget):
         self._preview_scroll.setToolTip("按住 Ctrl 滚动鼠标滚轮可放大或缩小；普通滚轮用于滚动图片")
         self._preview_pixmap = QPixmap()
         self._preview_zoom = 1.0
+        self._preview_stack = QStackedWidget()
+        self._preview_stack.addWidget(self._preview_scroll)
+        self._view_status = QLabel()
+        self._view_status.setWordWrap(True)
+        self._view_status.setVisible(frequency_cursor)
 
         view_button = QPushButton("查看大图")
         open_button = QPushButton("打开所在文件夹")
@@ -255,7 +265,8 @@ class ImageGalleryPane(QWidget):
         layout = QHBoxLayout(self)
         layout.addWidget(self._list)
         right_column = QVBoxLayout()
-        right_column.addWidget(self._preview_scroll)
+        right_column.addWidget(self._preview_stack, stretch=1)
+        right_column.addWidget(self._view_status)
         right_column.addLayout(button_row)
         layout.addLayout(right_column, stretch=1)
 
@@ -293,6 +304,29 @@ class ImageGalleryPane(QWidget):
             return
         self._preview_pixmap = pixmap
         self._preview_zoom = 1.0
+        self._preview_stack.setCurrentWidget(self._preview_scroll)
+        if self._linear_view is not None:
+            self._preview_stack.removeWidget(self._linear_view)
+            self._linear_view.deleteLater()
+            self._linear_view = None
+        if self._frequency_cursor:
+            from .linear_spectrogram_view import LinearSpectrogramView, load_spectrogram_meta, resolve_source_audio
+
+            meta = load_spectrogram_meta(path)
+            if meta is not None:
+                self._linear_view = LinearSpectrogramView(pixmap, meta, self)
+                has_audio = resolve_source_audio(path, meta) is not None
+                self._linear_view.set_time_navigation(has_audio)
+                self._linear_view.rangeSelected.connect(self._open_detail_range)
+                self._linear_view.timeZoomRequested.connect(self._open_detail_zoom)
+                self._preview_stack.addWidget(self._linear_view)
+                self._preview_stack.setCurrentWidget(self._linear_view)
+                self._view_status.setText(
+                    "移动鼠标读取频率；Shift+拖选或 Ctrl+滚轮，从 WAV 重算局部声谱。"
+                    if has_audio else "移动鼠标读取频率；Ctrl+滚轮缩放图片，左键拖动平移。"
+                )
+                return
+            self._view_status.setText("PNG 原图：Ctrl+滚轮缩放，左键拖动平移；缺少频率坐标信息，无法显示频率光标。")
         self._apply_preview_scale()
 
     def _zoom_preview_by(self, factor: float) -> None:
@@ -320,6 +354,8 @@ class ImageGalleryPane(QWidget):
         self._preview.adjustSize()
 
     def _show_placeholder(self, text: str) -> None:
+        self._preview_stack.setCurrentWidget(self._preview_scroll)
+        self._view_status.clear()
         self._preview_pixmap = QPixmap()
         self._preview_zoom = 1.0
         self._preview.setPixmap(QPixmap())
@@ -332,9 +368,27 @@ class ImageGalleryPane(QWidget):
             return self._paths[row]
         return None
 
-    def _open_large_view(self) -> None:
+    def _open_detail_range(self, low: float, high: float) -> None:
+        self._open_large_view(initial_range=(low, high))
+
+    def _open_detail_zoom(self, center: float, span: float) -> None:
+        self._open_large_view(zoom_request=(center, span))
+
+    def _open_large_view(self, checked=False, *, initial_range=None, zoom_request=None) -> None:
         path = self._current_path()
         if path is not None:
+            if self._frequency_cursor:
+                from .linear_spectrogram_view import LinearSpectrogramDialog, load_spectrogram_meta
+
+                meta = load_spectrogram_meta(path)
+                if meta is not None:
+                    dialog = LinearSpectrogramDialog(path, meta, title=path.name, parent=self)
+                    if initial_range is not None:
+                        QTimer.singleShot(0, lambda: dialog.request_detail(*initial_range))
+                    elif zoom_request is not None:
+                        QTimer.singleShot(0, lambda: dialog._zoom_time(*zoom_request))
+                    dialog.exec()
+                    return
             ImagePreviewDialog(path, self).exec()
 
     def _open_folder(self) -> None:
@@ -343,85 +397,30 @@ class ImageGalleryPane(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
 
-class PulseImagePane(QWidget):
-    """单张 pulse 大图：默认适应窗口，缩放与滚动不依赖缩略图库。"""
+class PngFolderDialog(QDialog):
+    """直接浏览 PNG 文件夹，按图片坐标信息启用线性频率光标。"""
 
-    def __init__(self, parent=None):
+    def __init__(self, path: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._pixmap = QPixmap()
-        self._mode = "fit"
-        self._zoom = 1.0
-        self._label = QLabel("选中一个 pulse 查看波形与声谱图。")
-        self._label.setAlignment(Qt.AlignCenter)
-        self._label.setStyleSheet("background:#202020; color:#c0c0c0;")
-        self._scroll = ZoomableImageScrollArea()
-        self._scroll.setWidget(self._label)
-        self._scroll.setWidgetResizable(False)
-        self._scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-        self._scroll.setMinimumHeight(280)
-        self._scroll.set_zoom_handler(self._zoom_by)
-        self._scroll.viewport().installEventFilter(self)
-        self._scroll.setToolTip("Ctrl+滚轮缩放；拖动平移；滚动查看完整图片。")
-        controls = QHBoxLayout()
-        for text, callback in (
-            ("适应宽度", lambda: self._set_mode("width")),
-            ("适应窗口", lambda: self._set_mode("fit")),
-            ("1:1", lambda: self._set_mode("original")),
-            ("放大", lambda: self._zoom_by(ZOOM_STEP)),
-            ("缩小", lambda: self._zoom_by(1 / ZOOM_STEP)),
-        ):
-            button = QPushButton(text)
-            button.clicked.connect(callback)
-            controls.addWidget(button)
-        controls.addStretch(1)
+        path = Path(path)
+        if path.is_dir():
+            paths = sorted(
+                (item for item in path.rglob("*") if item.is_file() and item.suffix.lower() == ".png"),
+                key=lambda item: str(item.relative_to(path)).casefold(),
+            )
+        elif path.is_file() and path.suffix.lower() == ".png":
+            paths = [path]
+        else:
+            raise ValueError("请拖入 PNG 图片或包含 PNG 图片的文件夹。")
+        if not paths:
+            raise ValueError(f"文件夹中没有 PNG 图片：{path}")
+        self.setWindowTitle(f"声谱图与线性图 | {path.name}")
+        self.resize(1320, 820)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._scroll, 1)
-        layout.addLayout(controls)
-
-    def show_image(self, path: Path | None):
-        self._pixmap = QPixmap(str(path)) if path is not None else QPixmap()
-        self._mode = "fit"
-        self._zoom = 1.0
-        self._scroll.horizontalScrollBar().setValue(0)
-        self._scroll.verticalScrollBar().setValue(0)
-        if self._pixmap.isNull():
-            self._label.setPixmap(QPixmap())
-            self._label.setText("未生成图片。" if path else "选中一个 pulse 查看波形与声谱图。")
-            self._label.adjustSize()
-        else:
-            self._label.clear()
-            self._render()
-            QTimer.singleShot(0, self._render)
-
-    def eventFilter(self, watched, event):
-        if watched is self._scroll.viewport() and event.type() == QEvent.Type.Resize:
-            QTimer.singleShot(0, self._render)
-        return super().eventFilter(watched, event)
-
-    def _set_mode(self, mode):
-        self._mode = mode
-        self._zoom = 1.0
-        self._render()
-
-    def _zoom_by(self, factor):
-        self._zoom = min(MAX_ZOOM, max(MIN_ZOOM, self._zoom * factor))
-        self._render()
-
-    def _render(self):
-        if self._pixmap.isNull():
-            return
-        viewport = self._scroll.viewport().size()
-        if self._mode == "original":
-            base = 1.0
-        elif self._mode == "fit":
-            base = min(viewport.width() / self._pixmap.width(), viewport.height() / self._pixmap.height())
-        else:
-            base = max(1, viewport.width() - 4) / self._pixmap.width()
-        size = _zoomed_size(self._pixmap.size(), max(base, 0.001) * self._zoom)
-        scaled = self._pixmap.scaled(size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self._label.setPixmap(scaled)
-        self._label.resize(scaled.size())
+        layout.addWidget(QLabel(f"{path}（{len(paths)} 张 PNG）"))
+        self._gallery = ImageGalleryPane(parent=self, frequency_cursor=True)
+        layout.addWidget(self._gallery, stretch=1)
+        self._gallery.set_paths(paths)
 
 
 class PulseSpectrogramDialog(QDialog):
@@ -464,14 +463,14 @@ class PulseSpectrogramDialog(QDialog):
 
         hint = QLabel(
             "图片按类别关联：合并图可包含多个叫声，分开图对应独立分量；unknown 也会列出。"
-            "图像上方为放大的时域波形，下方为彩色频谱和频率数据。"
-            "预览区支持 Ctrl+滚轮缩放、按住鼠标左键拖动。"
+            "图像与直接查看 WAV 使用同一显示样式：上方为橙色正负波形，下方为蓝底彩色声谱和频率数据。"
+            "关联 WAV 时可 Shift+拖选或 Ctrl+滚轮重算局部声谱；普通图片支持缩放与拖动。"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#666666;")
 
         self._gallery = ImageGalleryPane(
-            empty_hint="该类别没有生成逐声波声谱图。"
+            empty_hint="该类别没有生成逐声波声谱图。", frequency_cursor=True,
         )
         layout = QVBoxLayout(self)
         layout.addLayout(control_row)

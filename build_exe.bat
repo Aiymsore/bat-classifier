@@ -31,6 +31,14 @@ if exist "workspace_backup_tmp" (
 )
 
 echo.
+rem Build folders can inherit a Low integrity label from sandbox tooling.
+rem The desktop executable must run at the normal Medium integrity level.
+icacls "dist\BatClassifier\BatClassifier.exe" /setintegritylevel M >nul
+if errorlevel 1 (
+  echo [ERROR] Could not set normal desktop integrity on the EXE.
+  echo Run this build from a normal desktop terminal and try again.
+  exit /b 1
+)
 echo Build OK: dist\BatClassifier\BatClassifier.exe
 echo Note: run the exe in dist\BatClassifier\ (NOT the one inside build\ - that is an intermediate file).
 start "" explorer "dist\BatClassifier"

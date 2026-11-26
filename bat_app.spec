@@ -20,7 +20,7 @@ def is_runtime_module(name):
 
 datas = []
 binaries = []
-hiddenimports = []
+hiddenimports = ["bat_classifier.runtime_cache"]
 
 # 科学计算栈缺少标准 hook 的部分（librosa/numba/llvmlite 尤其），
 # 用 collect_all 连数据文件、动态库和子模块一起收进来。

@@ -41,6 +41,8 @@ from .config import (
     CORE_CONTEXT_MS,
     CORE_MAX_GAP_MS,
     CORE_PADDING_MS,
+    BOUNDARY_EXTEND_CONTEXT_MS,
+    BOUNDARY_BACKGROUND_CONTEXT_MS,
     MAX_PULSE_MS,
     MERGE_GAP_MS,
     PULSE_PADDING_MS,
@@ -66,15 +68,16 @@ PARTIAL_CSV_FILENAME = "pulse_results.partial.csv"
 # ---------------------------------------------------------------------------
 # overlap / chunk 网格
 # ---------------------------------------------------------------------------
-def minimum_overlap_seconds() -> float:
+def minimum_overlap_seconds(max_pulse_ms: float = MAX_PULSE_MS) -> float:
     """由现有 pulse/padding/refinement 参数推导的最小重叠（秒）。
 
     覆盖：最大脉冲时长 + 候选 padding×2 + 精修上下文×2 + 精修 padding×2
     + 合并间隔 + 滤波/重采样瞬态余量。绝不随意猜一个小值。
     """
     required_ms = (
-        MAX_PULSE_MS
+        float(max_pulse_ms)
         + 2 * PULSE_PADDING_MS
+        + 2 * max(BOUNDARY_EXTEND_CONTEXT_MS, BOUNDARY_BACKGROUND_CONTEXT_MS, float(max_pulse_ms))
         + 2 * CORE_CONTEXT_MS
         + 2 * CORE_PADDING_MS
         + CORE_MAX_GAP_MS
@@ -105,6 +108,7 @@ def build_chunk_specs(
     sr: int,
     chunk_seconds: float | None = None,
     overlap_seconds: float | None = None,
+    max_pulse_ms: float = MAX_PULSE_MS,
 ) -> list[ChunkSpec]:
     """把整条录音切成 chunk + overlap 的网格（coverage 连续铺满全长）。"""
     chunk_seconds = float(
@@ -117,7 +121,7 @@ def build_chunk_specs(
     )
     if chunk_seconds <= 0:
         raise ValueError("SEGMENT_STREAM_CHUNK_SECONDS 必须 > 0")
-    min_overlap = minimum_overlap_seconds()
+    min_overlap = minimum_overlap_seconds(max_pulse_ms)
     if overlap_seconds < min_overlap:
         raise ValueError(
             f"SEGMENT_STREAM_OVERLAP_SECONDS={overlap_seconds}s 不足："
@@ -396,6 +400,42 @@ def dedupe_cross_chunk_rows(
     return kept
 
 
+CROSS_CANDIDATE_FREQ_TOLERANCE_KHZ = 2.0
+
+
+def dedupe_cross_candidate_rows(rows: list[dict]) -> list[dict]:
+    """块内去重：子带检测会让同一叫声出现在两个候选区间里（例如全带候选
+    与相邻子带候选重叠不足而未合并）。不同候选中时间重叠 ≥0.50、
+    轨迹中位频率相差 ≤2 kHz 的分量视为同一叫声，保留 snr_db 高的一条。
+    同一候选内的多条同时发声分量绝不互并。"""
+    kept: list[dict] = []
+    for row in sorted(rows, key=lambda item: -float(item.get("snr_db", -999.0))):
+        duplicate = False
+        for other in kept:
+            if other.get("candidate_id") == row.get("candidate_id"):
+                continue
+            overlap = _interval_overlap_ratio(
+                float(other["start_s"]), float(other["end_s"]),
+                float(row["start_s"]), float(row["end_s"]),
+            )
+            if overlap < DEDUPE_OVERLAP_RATIO:
+                continue
+            try:
+                freq_gap = abs(
+                    float(other.get("track_median_freq_khz"))
+                    - float(row.get("track_median_freq_khz"))
+                )
+            except (TypeError, ValueError):
+                continue
+            if freq_gap <= CROSS_CANDIDATE_FREQ_TOLERANCE_KHZ:
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(row)
+    kept.sort(key=lambda item: (float(item["start_s"]), int(item.get("candidate_id", 0)), int(item.get("component_id", 0))))
+    return kept
+
+
 # ---------------------------------------------------------------------------
 # checkpoint / 断点续跑
 # ---------------------------------------------------------------------------
@@ -463,15 +503,27 @@ class ChunkCheckpoint:
             return
         import csv
 
+        wanted = list(columns or sorted(rows[0].keys()))
         with self._lock:
-            new_file = not self.partial_csv_path.exists()
-            with open(self.partial_csv_path, "a", newline="", encoding="utf-8-sig") as handle:
-                writer = csv.DictWriter(
-                    handle,
-                    fieldnames=columns or sorted(rows[0].keys()),
-                    extrasaction="ignore",
-                )
-                if new_file:
+            path = self.partial_csv_path
+            header: list[str] = []
+            if path.exists():
+                with open(path, "r", newline="", encoding="utf-8-sig") as handle:
+                    header = next(csv.reader(handle), []) or []
+            if header and not set(wanted) <= set(header):
+                # 后续批次出现新列：按扩展后的表头整体重写，已有行按列名对齐，新列留空。
+                with open(path, "r", newline="", encoding="utf-8-sig") as handle:
+                    existing = list(csv.DictReader(handle))
+                header = header + [key for key in wanted if key not in header]
+                with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=header, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(existing)
+            # 始终按文件已有表头写入：各批次列顺序或列集合不同也不会错位。
+            fieldnames = header or wanted
+            with open(path, "a", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+                if not header:
                     writer.writeheader()
                 for row in rows:
                     writer.writerow(row)
@@ -519,6 +571,10 @@ class ChunkContext:
     separation_window_mode: str = "fixed"
     harmonic_grouping_mode: str = "basic"
     retain_component_audio: bool = False
+    # 模板子带检测频带（kHz）；为空时只用原全带检测。
+    detection_bands_khz: tuple[tuple[float, float], ...] = ()
+    # 候选时长上限（ms）：有模板时取模板快照的 max_pulse_ms，长 CF 叫声不被整段丢弃。
+    max_pulse_ms: float = MAX_PULSE_MS
 
 
 @dataclass
@@ -539,7 +595,8 @@ def process_chunk(spec: ChunkSpec, context: ChunkContext) -> ChunkResult:
     from .pulse_table import create_pulse_rows
 
     read_y = context.preprocessor.block(spec.read_start_s, spec.read_end_s)
-    result = ChunkResult(spec=spec)
+    # 可视化也需要快筛跳过的背景块；消费后仍由调用方立即释放。
+    result = ChunkResult(spec=spec, read_y=read_y)
     if read_y.size == 0:
         result.skipped = True
         return result
@@ -549,8 +606,11 @@ def process_chunk(spec: ChunkSpec, context: ChunkContext) -> ChunkResult:
         result.skipped = True
         return result
 
-    raw_pulses, _power, _freqs, _times, threshold_db = detect_pulses(read_y, sr)
-    refined = refine_all_pulses(read_y, sr, raw_pulses)
+    raw_pulses, _power, _freqs, _times, threshold_db = detect_pulses(
+        read_y, sr, bands_khz=context.detection_bands_khz or None,
+        max_duration_ms=context.max_pulse_ms,
+    )
+    refined = refine_all_pulses(read_y, sr, raw_pulses, max_duration_ms=context.max_pulse_ms)
     result.raw_candidate_count = len(raw_pulses)
     result.threshold_db = float(threshold_db)
 
@@ -569,7 +629,12 @@ def process_chunk(spec: ChunkSpec, context: ChunkContext) -> ChunkResult:
         read_y,
         sr,
         owned,
-        separated_dir=context.separated_dir,
+        # 候选编号在每块内从 1 开始；按块分目录，避免并行块写同名分量 WAV
+        # （Windows 上会打开失败），或后一块在导出前覆盖前一块的分量音频。
+        separated_dir=(
+            context.separated_dir / f"{context.wav_path.stem}_chunk{spec.index:06d}"
+            if context.separated_dir is not None else None
+        ),
         max_pulses=None,          # 计数绝不被截断（导出上限另算）
         save_separated_audio=context.save_separated_audio,
         include_template_track=context.template_matching,
@@ -577,12 +642,15 @@ def process_chunk(spec: ChunkSpec, context: ChunkContext) -> ChunkResult:
         harmonic_grouping_mode=context.harmonic_grouping_mode,
         component_audio_sink=result.component_audio if context.retain_component_audio else None,
     )
+    if context.detection_bands_khz:
+        rows = dedupe_cross_candidate_rows(rows)
     # 块内 local 时间 → global 绝对时间；事件编号包含录音身份，跨录音/块不冲突。
     recording_key = hashlib.sha256(str(context.wav_path.resolve()).encode("utf-8")).hexdigest()[:12]
     for row in rows:
         row.pop("accepted", None)
         row.pop("rejection_reason", None)
-        for key in ("candidate_start_s", "candidate_end_s", "start_s", "end_s"):
+        for key in ("candidate_start_s", "candidate_end_s", "start_s", "end_s",
+                    "core_start_s", "core_end_s", "boundary_start_s", "boundary_end_s"):
             if key in row:
                 row[key] = float(row[key]) + spec.read_start_s
         row["_chunk_index"] = spec.index
@@ -725,7 +793,7 @@ def current_rss_mb() -> float:
 # 流式低分辨率 overview（§15：只用于可视化，绝不参与 call 统计）
 # ---------------------------------------------------------------------------
 class SpectrogramSummary:
-    """流式累计 overview 声谱摘要（严格限制 time bins，禁止整条 STFT）。"""
+    """有界的声谱摘要与真实波形峰谷；不保留整条录音。"""
 
     def __init__(
         self,
@@ -733,20 +801,34 @@ class SpectrogramSummary:
         sr: int = TARGET_SAMPLE_RATE,
         max_time_bins: int = 4000,
         n_fft: int = 1024,
+        max_waveform_points: int = 24_000,
     ) -> None:
         self.sr = int(sr)
         self.n_fft = int(n_fft)
+        self.total_duration_s = float(total_duration_s)
         hop = int(np.ceil(max(total_duration_s, 1e-6) * self.sr / max_time_bins))
         self.hop_length = max(self.n_fft // 4, hop)
         self.n_frames = int(
             np.ceil(max(total_duration_s, 1e-6) * self.sr / self.hop_length)
         ) + 1
         self._power: np.ndarray | None = None
+        self._total_samples = max(1, int(round(total_duration_s * self.sr)))
+        self._waveform_bucket = max(
+            1, int(np.ceil(self._total_samples / max(1, max_waveform_points // 2))),
+        )
+        bins = int(np.ceil(self._total_samples / self._waveform_bucket))
+        self._waveform_low = np.full(bins, np.inf)
+        self._waveform_high = np.full(bins, -np.inf)
+        self._waveform_low_sample = np.zeros(bins, dtype=np.int64)
+        self._waveform_high_sample = np.zeros(bins, dtype=np.int64)
 
     def add(self, block: np.ndarray, read_start_s: float) -> None:
         import librosa
 
-        if block is None or len(block) < self.n_fft:
+        if block is None or not len(block):
+            return
+        self._add_waveform(block, read_start_s)
+        if len(block) < self.n_fft:
             return
         stft = librosa.stft(
             np.asarray(block, dtype=np.float64),
@@ -770,6 +852,40 @@ class SpectrogramSummary:
                 self._power[:, index], power[:, column].astype(np.float32),
                 out=self._power[:, index],
             )
+
+    def _add_waveform(self, block: np.ndarray, read_start_s: float) -> None:
+        """按全局采样位置分桶，保留原始正负峰值和时间；重叠块可重复添加。"""
+        offset = int(round(read_start_s * self.sr))
+        start = max(0, offset)
+        end = min(self._total_samples, offset + len(block))
+        if end <= start:
+            return
+        for index in range(start // self._waveform_bucket, (end - 1) // self._waveform_bucket + 1):
+            left = max(start, index * self._waveform_bucket)
+            right = min(end, (index + 1) * self._waveform_bucket)
+            chunk = np.asarray(block[left - offset:right - offset], dtype=np.float64)
+            chunk = np.where(np.isfinite(chunk), chunk, 0.0)
+            low = int(np.argmin(chunk))
+            high = int(np.argmax(chunk))
+            if chunk[low] < self._waveform_low[index]:
+                self._waveform_low[index] = chunk[low]
+                self._waveform_low_sample[index] = left + low
+            if chunk[high] > self._waveform_high[index]:
+                self._waveform_high[index] = chunk[high]
+                self._waveform_high_sample[index] = left + high
+
+    @property
+    def waveform_trace(self) -> tuple[np.ndarray, np.ndarray] | None:
+        valid = np.isfinite(self._waveform_low) & np.isfinite(self._waveform_high)
+        if not valid.any():
+            return None
+        samples = np.column_stack((self._waveform_low_sample[valid], self._waveform_high_sample[valid])).ravel()
+        values = np.column_stack((self._waveform_low[valid], self._waveform_high[valid])).ravel()
+        order = np.argsort(samples, kind="stable")
+        peak = float(np.max(np.abs(values)))
+        if peak > 0:
+            values = values / peak
+        return samples[order] / float(self.sr), values[order]
 
     @property
     def power(self) -> np.ndarray | None:

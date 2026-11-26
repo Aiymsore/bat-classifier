@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import warnings
+from copy import deepcopy
 from pathlib import Path
 
 import librosa
@@ -16,11 +17,17 @@ import soundfile as sf
 from scipy.signal import find_peaks
 
 from .audio_io import ultrasonic_band_mask
+from .features import mask_concentrations
 from .harmonics import group_harmonic_tracks, harmonic_component_metadata
 from .config import (
+    BOUNDARY_EXTEND_MARGIN_DB,
+    BOUNDARY_EXTEND_MAX_GAP_MS,
+    BOUNDARY_TRACK_STEP_KHZ,
     BASE_DIR,
     CORE_PADDING_MS,
     ENABLE_SIMULTANEOUS_SEPARATION,
+    GATE_LOCAL_CONCENTRATION_MIN_HALF_WIDTH_KHZ,
+    GATE_LOCAL_CONCENTRATION_RADIUS_FACTOR,
     MIN_PULSE_MS,
     SEPARATED_PULSE_DIR,
     SEPARATION_FRAME_DYNAMIC_RANGE_DB,
@@ -42,6 +49,47 @@ from .config import (
     SEPARATION_PEAK_PROMINENCE_DB,
     SEPARATION_WIN_LENGTH,
 )
+
+
+def _extend_observed_track_edges(track, power, frequencies, sr):
+    """Recover observed weak ridge ends within the refined parent only.
+
+    Peak contrast is measured in the original mixture. No zero padding or
+    unobserved frequency interpolation is used to invent extension frames.
+    """
+    original_frames=np.asarray(track['frames'],dtype=int)
+    original_freqs=np.asarray(track['frequencies_hz'],dtype=float)
+    if not len(original_frames):
+        return
+    reference=float(np.median(original_freqs))
+    stable=float(np.percentile(original_freqs,90)-np.percentile(original_freqs,10))<=1500.
+    max_gap=max(1,int(round(BOUNDARY_EXTEND_MAX_GAP_MS/1000*sr/SEPARATION_HOP_LENGTH)))
+    found={int(i):(float(f),float(p)) for i,f,p in zip(original_frames,original_freqs,track['powers'])}
+    for origin,step,previous in [(int(original_frames[0]),-1,float(original_freqs[0])),
+                               (int(original_frames[-1]),1,float(original_freqs[-1]))]:
+        gap=0;frame=origin+step
+        while 0<=frame<power.shape[1]:
+            search=np.abs(frequencies-previous)<=max(BOUNDARY_TRACK_STEP_KHZ*1000,2*np.median(np.diff(frequencies)))
+            if stable:
+                search &= np.abs(frequencies-reference)<=1500.
+            bins=np.flatnonzero(search)
+            if not len(bins):break
+            k=int(bins[np.argmax(power[bins,frame])]);value=float(power[k,frame])
+            peak=(k==0 or value>=power[k-1,frame]) and (k==len(frequencies)-1 or value>=power[k+1,frame])
+            distances=np.abs(frequencies-frequencies[k])
+            neighbors=(distances>=1500.)&(distances<=6000.)
+            noise=float(np.median(power[neighbors,frame])) if neighbors.any() else value
+            if peak and value>max(noise,1e-30)*10**(BOUNDARY_EXTEND_MARGIN_DB/10):
+                found[frame]=(float(frequencies[k]),value);previous=float(frequencies[k]);gap=0
+            else:
+                gap+=1
+                if gap>max_gap:break
+            frame+=step
+    frames=sorted(found)
+    track['frames']=np.asarray(frames,dtype=int)
+    track['frequencies_hz']=np.asarray([found[i][0] for i in frames])
+    track['powers']=np.asarray([found[i][1] for i in frames])
+    track['coverage']=len(frames)/max(1,frames[-1]-frames[0]+1)
 
 
 def _track_frequency_at_frames(
@@ -483,12 +531,15 @@ def separate_simultaneous_pulse_components(
         sr,
     )
     if len(tracks) < 2:
+        if tracks:
+            unchanged["_gate_track"] = _gate_track_material(tracks[0], sr, power=band_power, frequencies=band_frequencies)
         return [unchanged]
 
     if harmonic_grouping_mode == "enhanced":
         tracks = group_harmonic_tracks(tracks)
         if len(tracks) == 1:
             unchanged.update(harmonic_component_metadata(tracks[0]))
+            unchanged["_gate_track"] = _gate_track_material(tracks[0], sr, power=band_power, frequencies=band_frequencies)
             return [unchanged]
     reject_basic_harmonics = harmonic_grouping_mode == "basic"
     primary = tracks[0]
@@ -554,7 +605,18 @@ def separate_simultaneous_pulse_components(
         ):
             break
 
+    quality_tracks={id(track):deepcopy(track) for track in selected_tracks}
+    for track in selected_tracks:
+        members=track.get('_harmonic_members',[])
+        for member in members:
+            if member is not track:
+                _extend_observed_track_edges(member,band_power,band_frequencies,sr)
+        _extend_observed_track_edges(track,band_power,band_frequencies,sr)
+
     if len(selected_tracks) < 2:
+        unchanged["_gate_track"] = _gate_track_material(quality_tracks[id(primary)], sr, power=band_power, frequencies=band_frequencies)
+        unchanged["_boundary_track"] = _gate_track_material(primary, sr, power=band_power, frequencies=band_frequencies)
+        unchanged.update(harmonic_component_metadata(primary))
         return [unchanged]
 
     frame_numbers = np.arange(
@@ -753,10 +815,52 @@ def separate_simultaneous_pulse_components(
                     separation_confidence
                 ),
                 **harmonic_component_metadata(track),
+                "_gate_track": _gate_track_material(quality_tracks[id(track)], sr, start_sample, power=band_power, frequencies=band_frequencies),
+                "_boundary_track": _gate_track_material(track, sr, start_sample, power=band_power, frequencies=band_frequencies),
             }
         )
 
     return components
+
+
+def _gate_track_material(
+    track: dict, sr: int, offset_samples: int = 0,
+    *, power: np.ndarray | None = None, frequencies: np.ndarray | None = None,
+) -> dict:
+    """仅传递已观测的连续轨迹，随当前分量释放，不写入结果或模板。"""
+    frames = np.asarray(track["frames"], dtype=int)
+    span = max(1, int(frames[-1] - frames[0] + 1))
+    material = {
+        "times_s": (frames * SEPARATION_HOP_LENGTH - offset_samples) / float(sr),
+        "frequencies_hz": np.asarray(track["frequencies_hz"], dtype=float),
+        "coverage": len(frames) / span,
+    }
+    if power is not None and frequencies is not None:
+        # 用分离前已有功率谱验证支持度，不能让窄带掩膜把宽带噪声变成高质量轨迹。
+        selected_power = power[:, frames]
+        near_bands = np.zeros(selected_power.shape, dtype=bool)
+        local_bands = np.zeros(selected_power.shape, dtype=bool)
+        local_radius = max(
+            GATE_LOCAL_CONCENTRATION_MIN_HALF_WIDTH_KHZ * 1000.0,
+            GATE_LOCAL_CONCENTRATION_RADIUS_FACTOR * 1500.0,
+        )
+        for member in track.get("_harmonic_members", [track]):
+            curve = _track_frequency_at_frames(member, frames)
+            in_time = (frames >= member["frames"][0]) & (frames <= member["frames"][-1])
+            offsets = np.abs(frequencies[:, None] - curve[None, :])
+            near_bands |= (offsets <= 1500.0) & in_time
+            local_bands |= (offsets <= local_radius) & in_time
+        concentration, concentration_local = mask_concentrations(
+            selected_power, near_bands, local_bands,
+        )
+        material["original_concentration"] = concentration
+        material["original_concentration_local"] = concentration_local
+        totals = np.maximum(np.sum(selected_power, axis=0), 1e-18)
+        probabilities = selected_power / totals
+        material["original_entropy"] = float(np.mean(-np.sum(
+            probabilities * np.log(np.maximum(probabilities, 1e-18)), axis=0)
+            / np.log(max(len(frequencies), 2))))
+    return material
 
 
 def save_separated_pulse(
